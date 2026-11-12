@@ -1,0 +1,81 @@
+# Tick Chart
+
+An MT5-style **historical tick chart** viewer with **replay** and **paper trading**. It runs in your browser from a single local page. Nothing is uploaded, and your tick data stays on your PC.
+
+- N-tick candles (50 by default) that rebuild instantly when you change the tick count
+- Each new day starts a fresh candle, like TickChart GenX's "Synchronize first bar's open on new day"
+- 2 moving averages (SMA / EMA / SMMA / LWMA, the same methods as MT5)
+- Daily CPR (P, TC, BC) plus floor pivots R1–R3 / S1–S3, with an info panel showing CPR width, price vs CPR, and the relationship to the previous day's CPR
+- Replay one tick at a time, one candle at a time, or at a multiple of real time. You can also jump to any date/time
+- Paper trading with bid/ask spread: market orders, plus limit/stop orders you place by clicking on the chart. S/L and T/P lines can be dragged, and you can export your trade log to CSV
+
+## Quick start
+
+1. Download/clone this repo.
+2. Double-click **`index.html`** (Chrome or Edge recommended). No install or server is needed.
+3. Open your tick file with **📂 Open ticks**, or drag it onto the page.
+   No file yet? Choose **Demo data** to try the app.
+
+## Getting tick data out of MT5
+
+### Option A: ExportTicks script (recommended)
+
+1. In MT5: **File → Open Data Folder → MQL5 → Scripts**. Copy `mql5/ExportTicks.mq5` there.
+2. In MetaEditor, open it and press **Compile** (F7). Alternatively, right-click Scripts in the MT5 Navigator → Refresh.
+3. Drag **ExportTicks** onto a GER40 or XAUUSD chart. Inputs:
+   - `Trading days` – how many days to export, including today (for example 5)
+   - `Also export the day before` – keep this **on** so the first day also gets its CPR
+   - Or set an explicit start/end date instead
+4. The file is saved to `MQL5\Files\SYMBOL_ticks_FROM_to_TO.csv`. A popup shows the full path.
+
+### Option B: MT5 built-in export
+
+**View → Symbols → Ticks** tab → pick the symbol and date range → **Request** → **Export ticks**.
+The app reads this tab-separated format directly (UTF-16 or UTF-8).
+
+> All times are your broker's **server time**, exactly as MT5 shows them. Days, and therefore CPR and the day-start candle sync, roll over at server midnight.
+
+## Using the chart
+
+| Action | How |
+|---|---|
+| Zoom / scroll | Mouse wheel / drag the chart. Drag the price axis to stretch it |
+| Change ticks per candle | Box in the toolbar (presets 10…1000) |
+| Indicators, colours, trading settings | **⚙ Settings** |
+| Jump to a time | Date box → **Go** |
+
+### Replay
+
+1. Click **⏪ Replay**, then click a candle. Replay starts right after it. You can also enter a date/time and press **Go**.
+2. **▶** / **Space** play/pause · **⏭** / **→** next candle · **+1** / **Shift+→** next tick.
+3. Speed units: *ticks/s*, *candles/s*, or *× real time* (long gaps such as overnight are skipped).
+4. **⏹ Stop replay** returns to the full history. Any open trades are closed at the current price.
+
+### Paper trading (during replay)
+
+- **BUY / SELL** buttons (top-left), or keys **B** / **S**: market order at ask / bid.
+- **Buy Limit / Sell Limit**, then click the chart at your price. If you click on the "wrong" side of the market, it becomes a Stop order.
+- **Drag** an order line to move it. Its S/L and T/P move with it.
+- **Drag** S/L or T/P lines to adjust them.
+- **Drag a position's entry line** up or down to create a T/P or S/L (like MT5).
+- **+SL / +TP / ✕** buttons in the Trade tab. Default S/L and T/P distances can be set in Settings.
+- Fills: buy orders fill at ask, sell orders at bid. Limit orders and T/P fill at your price; stop orders and S/L fill at the market price, so a gap causes slippage.
+- **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, with defaults of GER40 = 1 EUR and XAUUSD = 100 USD. Check your broker's contract specification.
+- The History tab has **Export CSV** and **Reset account**.
+
+## How ticks are counted
+
+*Every tick* (the default) counts every tick record from MT5, as most MT5 tick-chart tools do. *Only bid changes* ignores ticks where only the ask moved. Candles are always drawn from the **bid** price, like MT5 charts.
+
+## Project layout
+
+```
+index.html            page
+css/style.css         styles
+js/data.js            parsing, tick candles, CPR, moving averages
+js/app.js             chart, replay, paper trading, UI
+js/lib/               TradingView Lightweight Charts v4.2.0 (Apache-2.0)
+mql5/ExportTicks.mq5  MT5 export script
+```
+
+Charts are rendered with [TradingView Lightweight Charts™](https://www.tradingview.com/lightweight-charts/) (Apache License 2.0; see `js/lib/LIGHTWEIGHT-CHARTS-LICENSE`).
