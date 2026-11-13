@@ -175,8 +175,9 @@
     let anchor = price;
     const vol = gold ? 0.05 : 0.5;
     const spread = gold ? 0.25 : 1.2;
-    let seed = 12345;
-    function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+    // mulberry32: a proper PRNG (the old LCG overflowed JS number precision and repeated patterns)
+    let seed = gold ? 2654435 : 1234567;
+    function rnd() { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }
     function gauss() { let u = 0, v = 0; while (!u) u = rnd(); v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
     const start = Date.UTC(2026, 10, 9); // Mon 9 Nov 2026
     let drift = 0;

@@ -81,6 +81,26 @@ The app reads this tab-separated format directly (UTF-16 or UTF-8).
 - **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, in USD, with defaults of GER40 = 11.6 USD (10 EUR per point per lot, converted at about 1.16 USD/EUR) and XAUUSD = 100 USD. With the bridge, the value comes from MT5. Check your broker's contract specification.
 - The History tab has **Export CSV** and **Reset account**.
 
+## Next-candle forecast (pattern matching)
+
+At every candle close, the app describes the situation in numbers. It uses:
+- the last 5 candle shapes
+- momentum
+- price against MA 1, MA 2 and the CPR levels
+- volatility and candle speed
+- the time of day
+
+It then finds the most similar moments in history and shows what the **next** candle did after them.
+
+- **Ghost box** over the forming (or next) candle: the inner box is where the next candle stayed half the time, the outer box 80% of the time. The thick line is the average move, and the label is the direction odds.
+- **Panel** (**Next ⓘ**): up/down odds compared with the normal rate, the likely range in points, and how many past patterns it is based on. It only says "leans UP/DOWN" when the difference is statistically meaningful.
+- **Test on unseen data**: the method learns from the first 70% of the history and is graded on the remaining 30%. If direction accuracy can't beat a coin flip, it says **no reliable edge**.
+- **Scorecard**: during replay or live, it counts how often the forecast was right.
+- **No peeking**: a forecast only learns from candles that had finished before it. In replay, the future is never used.
+- **More history = better statistics.** With the bridge, it learns from the last 30 days of MT5 history (Settings: 10–60 days). With files, it uses the days you loaded.
+
+Expect the direction odds to sit close to 50%: short-term direction is mostly noise. The range forecast is usually the more useful part, for placing S/L and T/P.
+
 ## How ticks are counted
 
 *Every tick* (the default) counts every tick record from MT5, as most MT5 tick-chart tools do. *Only bid changes* ignores ticks where only the ask moved. Candles are always drawn from the **bid** price, like MT5 charts.
@@ -92,6 +112,7 @@ index.html            page
 css/style.css         styles
 js/data.js            parsing, tick candles (incremental), CPR, moving averages
 js/time.js            server time -> local time
+js/forecast.js        next-candle forecast (pattern matching + out-of-sample test)
 js/app.js             chart, replay, paper + live trading, lines, UI
 bridge/               Python bridge to MT5 (tickbridge.py, start_bridge.bat, SETUP.md)
 js/lib/               TradingView Lightweight Charts v4.2.0 (Apache-2.0)

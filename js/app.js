@@ -20,7 +20,8 @@
     tz: { display: 'America/Toronto', server: 'ny7' },
     vppBySymbol: {}, curBySymbol: {},
     speedMode: 'tick', speeds: { tick: 50, candle: 2, time: 10 },
-    liveSymbol: '', infoOpen: true, panelOpen: true
+    liveSymbol: '', infoOpen: true, panelOpen: true,
+    fc: { on: true, box: true, panel: true, days: 30 }
   };
   const SPEEDS = {
     tick: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
@@ -38,7 +39,7 @@
   let S;
   try { S = merge(DEFAULTS, JSON.parse(localStorage.getItem('tickchart.settings') || '{}')); } catch (e) { S = merge(DEFAULTS, {}); }
   const narrowScreen = () => window.matchMedia('(max-width: 760px)').matches;
-  if (narrowScreen() && !localStorage.getItem('tickchart.settings')) { S.infoOpen = false; S.panelOpen = false; }
+  if (narrowScreen() && !localStorage.getItem('tickchart.settings')) { S.infoOpen = false; S.panelOpen = false; S.fc.panel = false; }
   function saveSettings() { try { localStorage.setItem('tickchart.settings', JSON.stringify(S)); } catch (e) { /* ignore */ } }
 
   // ====================================================================
@@ -55,6 +56,9 @@
     positions: [], orders: [], connected: false, retry: 0, reconnectT: 0, ignoreSnapUntil: 0, inflight: 0
   };
   const HL = { list: [], selected: null, symbol: '' };
+  // next-candle forecast state
+  const FCS = { model: null, offset: 0, train: null, trainKey: '', trainDays: 0, loading: false, val: null, valProgress: -1, valToken: 0,
+    pred: null, target: -1, anchor: NaN, score: { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0 } };
 
   const symbolKey = () => (ticks ? ticks.symbol.replace(/\s*\(demo\)/, '').toUpperCase() : '');
   const symInfo = () => (LIVE.symInfo && ticks && LIVE.symInfo.name.toUpperCase() === symbolKey()) ? LIVE.symInfo : null;
@@ -160,6 +164,7 @@
     if (!ticks) return;
     C = D.buildCandles(ticks, Math.max(2, +S.tickSize | 0), S.countMode, S.syncDay);
     rebuildMAs();
+    rebuildForecast(true);
     $('titleSym').textContent = `${ticks.symbol}.Tick.${C.size}`;
   }
   function rebuildMAs() {
@@ -228,6 +233,7 @@
       else { for (let k = R.shownCi; k < ci; k++) updateOne(k, fullBar(k), true); updateOne(ci, bar, final); }
       R.shownCi = ci;
     }
+    updateForecast();
     refreshMarkers();
     syncLines();
     scheduleUI();
@@ -238,7 +244,7 @@
   // ====================================================================
   let uiPending = false;
   function scheduleUI() { if (!uiPending) { uiPending = true; requestAnimationFrame(() => { uiPending = false; drawUI(); }); } }
-  function drawUI() { drawInfo(); drawDaySeps(); drawOneClick(); drawTables(); drawStatus(); drawLiveStatus(); drawLineMenu(); }
+  function drawUI() { drawInfo(); drawDaySeps(); drawOneClick(); drawTables(); drawStatus(); drawLiveStatus(); drawLineMenu(); drawFcPanel(); drawFcBox(); }
 
   function cprRelation(cur, prev) {
     if (!prev) return null;
@@ -329,7 +335,7 @@
     el.textContent = parts.join('  ·  ');
   }
 
-  chart.timeScale().subscribeVisibleLogicalRangeChange(() => { drawDaySeps(); });
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => { drawDaySeps(); drawFcBox(); drawLineMenu(); });
   new ResizeObserver(() => scheduleUI()).observe(chartEl);
 
   chart.subscribeCrosshairMove(param => {
@@ -373,6 +379,7 @@
   function setTicks(tk, opts = {}) {
     stopReplay(true);
     ticks = tk;
+    FCS.train = null; FCS.trainKey = ''; FCS.trainDays = 0; resetScore();
     resetAccount(true);
     rebuildCPR();
     rebuildCandles();
@@ -387,6 +394,7 @@
     loadLines();
     render(true);
     chart.timeScale().scrollToRealTime();
+    fetchTraining();
     if (!opts.quiet) {
       const noCpr = days.length && !cprMap.get(days[0].day);
       toast(`Loaded ${ticks.n.toLocaleString()} ticks of ${ticks.symbol}: ${days.map(d => dayName(d.day)).join(', ')}` + (noCpr ? ' — first day has no CPR (no previous day)' : ''), 5000);
@@ -447,6 +455,7 @@
     rebuildCandles();
     R.shownCi = -1;
     render(true);
+    fetchTraining();
     if (!tail() && centerTime !== null) scrollToTime(centerTime, false);
   });
   function visibleCenterTime() {
@@ -493,7 +502,7 @@
     R.picking = false; chartEl.classList.remove('placing'); hint(null);
     if (R.active && cursor > R.cursor) { advanceTo(cursor); }
     else {
-      R.active = true; R.cursor = cursor; R.shownCi = -1;
+      R.active = true; R.cursor = cursor; R.shownCi = -1; resetScore(); FCS.target = -1;
       render(true);
       chart.timeScale().scrollToRealTime();
     }
@@ -1118,8 +1127,154 @@
   }));
   function applyPanel() { $('panel').classList.toggle('collapsed', !S.panelOpen); $('btnPanel').textContent = S.panelOpen ? '▾' : '▴'; }
   $('btnPanel').addEventListener('click', () => { S.panelOpen = !S.panelOpen; applyPanel(); saveSettings(); });
-  $('btnInfo').addEventListener('click', () => { S.infoOpen = !S.infoOpen; saveSettings(); scheduleUI(); });
+  $('btnInfo').addEventListener('click', () => { S.infoOpen = !S.infoOpen; if (S.infoOpen && narrowScreen()) S.fc.panel = false; saveSettings(); scheduleUI(); });
+  $('btnFc').addEventListener('click', () => { S.fc.panel = !S.fc.panel; if (S.fc.panel && narrowScreen()) S.infoOpen = false; saveSettings(); scheduleUI(); });
   applyPanel();
+
+  // ====================================================================
+  // Next-candle forecast (pattern matching — see js/forecast.js)
+  // ====================================================================
+  const FC = TickForecast;
+  function resetScore() { FCS.score = { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0 }; }
+  // Training candles (bridge) + the loaded candles, as one series for the pattern search.
+  function fcData() {
+    const tr = FCS.train;
+    let n0 = 0;
+    if (tr) { while (n0 < tr.t.length && tr.t[n0] < ticks.t[0]) n0++; }
+    const n = n0 + C.n;
+    const o = new Float64Array(n), h = new Float64Array(n), l = new Float64Array(n), c = new Float64Array(n), t = new Float64Array(n), dur = new Float64Array(n);
+    for (let i = 0; i < n0; i++) { o[i] = tr.o[i]; h[i] = tr.h[i]; l[i] = tr.l[i]; c[i] = tr.c[i]; t[i] = tr.t[i]; dur[i] = tr.dur[i]; }
+    for (let k = 0; k < C.n; k++) {
+      const i = n0 + k;
+      o[i] = C.o[k]; h[i] = C.h[k]; l[i] = C.l[k]; c[i] = C.c[k]; t[i] = C.t[k]; dur[i] = ticks.t[C.end[k]] - ticks.t[C.start[k]];
+    }
+    return { data: { n, o, h, l, c, t, dur }, offset: n0 };
+  }
+  function rebuildForecast(full) {
+    if (!S.fc.on || !C || !ticks) { FCS.model = null; FCS.pred = null; return; }
+    const { data, offset } = fcData();
+    FCS.model = FC.prepare(data, { ma1: S.ma1, ma2: S.ma2 });
+    FCS.offset = offset;
+    if (full) { FCS.target = -1; FCS.pred = null; runValidation(); }
+  }
+  async function runValidation() {
+    const token = ++FCS.valToken;
+    FCS.val = null; FCS.valProgress = 0;
+    await new Promise(r => setTimeout(r, 60));
+    if (token !== FCS.valToken || !FCS.model) return;
+    const M = FCS.model;
+    const v = await FC.validate(M, M.n, p => { if (token === FCS.valToken) { FCS.valProgress = p; scheduleUI(); } });
+    if (token !== FCS.valToken) return;
+    FCS.val = v; FCS.valProgress = -1; scheduleUI();
+  }
+  // Which candle are we forecasting? The forming candle in replay/live, otherwise the next one.
+  function fcTarget() {
+    if (!C) return -1;
+    if (tail()) {
+      const ci = R.shownCi;
+      return (LIVE.on || curIdx() < C.end[ci]) ? ci : ci + 1;
+    }
+    return C.n;
+  }
+  function updateForecast() {
+    if (!S.fc.on || !FCS.model) { FCS.pred = null; return; }
+    const T = fcTarget();
+    if (T === FCS.target) return;
+    // score the forecast for the candle that just finished
+    const P = FCS.target;
+    if (tail() && FCS.pred && FCS.pred.ok && P >= 1 && T > P && P < C.n && C.day[P] === C.day[P - 1]) {
+      const a = FCS.anchor, y = C.c[P] > a, sc = FCS.score;
+      sc.n++;
+      if ((FCS.pred.pUp > 0.5) === y) sc.hit++;
+      sc.cov += ((C.h[P] - a) <= FCS.pred.up80 ? 0.5 : 0) + ((a - C.l[P]) <= FCS.pred.dn80 ? 0.5 : 0);
+      if (Math.abs(FCS.pred.z) >= 2) { sc.confN++; if ((FCS.pred.pUp > FCS.pred.baseUp) === y) sc.confHit++; }
+    }
+    FCS.target = T;
+    if (T < 1) { FCS.pred = { ok: false, reason: 'not enough candles yet' }; return; }
+    const iNow = FCS.offset + T - 1;              // last finished candle
+    FCS.anchor = C.c[T - 1];
+    FCS.newDay = T < C.n && C.day[T] !== C.day[T - 1];
+    FCS.pred = FC.predict(FCS.model, iNow, iNow - 1);   // learns only from outcomes known by now
+  }
+  const pct = x => (x * 100).toFixed(0) + '%';
+  function leanOf(p) { return p.z >= 2 ? 'up' : p.z <= -2 ? 'down' : 'flat'; }
+  function drawFcPanel() {
+    const el = $('fcPanel');
+    $('btnFc').classList.toggle('active', !!(S.fc.on && S.fc.panel));
+    $('btnFc').classList.toggle('hidden', !S.fc.on);
+    if (!S.fc.on || !S.fc.panel || !C) { el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    const L = [];
+    const p = FCS.pred, v = FCS.val;
+    const learned = FCS.model ? `${(FCS.model.n).toLocaleString()} candles${FCS.trainDays ? ` (${FCS.trainDays} days from MT5 + loaded)` : ' (loaded data)'}` : '';
+    L.push(`<span class="w">NEXT CANDLE · pattern match</span>${FCS.loading ? '  <span class="o">learning from MT5 history…</span>' : ''}`);
+    if (!p || !p.ok) {
+      L.push(`<span class="m">${p ? p.reason : 'waiting for data'}.</span>`);
+      if (!FCS.train) L.push(`<span class="m">${LIVE.bridge ? 'Loading more history from MT5…' : 'Load more days (or use the bridge) for a forecast.'}</span>`);
+    } else {
+      const lean = leanOf(p);
+      const cls = lean === 'up' ? 'g' : lean === 'down' ? 'r' : 'b';
+      const verdict = lean === 'up' ? 'leans UP' : lean === 'down' ? 'leans DOWN' : 'no clear edge';
+      L.push(`<span class="${cls}">Up ${pct(p.pUp)}  Down ${pct(1 - p.pUp)}   (normal ${pct(p.baseUp)} up) → ${verdict}</span>`);
+      L.push(`<span class="w">Likely range  50%: +${p.up50.toFixed(1)} / −${p.dn50.toFixed(1)}   80%: +${p.up80.toFixed(1)} / −${p.dn80.toFixed(1)} pts</span>`);
+      L.push(`<span class="m">Avg move after similar: ${p.move >= 0 ? '+' : ''}${p.move.toFixed(1)} pts · ${p.K} most similar of ${p.N.toLocaleString()} past candles${FCS.newDay ? ' · new day: less reliable' : ''}</span>`);
+    }
+    if (FCS.valProgress >= 0) L.push(`<span class="m">Testing on unseen data… ${pct(FCS.valProgress)}</span>`);
+    else if (v && !v.ok) L.push(`<span class="m">Test: ${v.reason}</span>`);
+    else if (v && v.ok) {
+      const dirTxt = v.edge ? `<span class="g">direction ${pct(v.acc)} right (coin 50%) → some edge</span>` : `<span class="o">direction ${pct(v.acc)} right (coin 50%) → no reliable edge</span>`;
+      const covOk = Math.abs(v.cov80 - 0.8) <= 0.06;
+      L.push(`<span class="m">Test on ${v.n} unseen candles:</span> ${dirTxt} <span class="m">·</span> <span class="${covOk ? 'g' : 'o'}">range band held ${pct(v.cov80)} (aim 80%)</span>`);
+    }
+    const sc = FCS.score;
+    if (tail() && sc.n) L.push(`<span class="w">This ${R.active ? 'replay' : 'session'}: ${sc.hit}/${sc.n} direction right (${pct(sc.hit / sc.n)}) · band held ${pct(sc.cov / sc.n)}${sc.confN ? ` · when leaning: ${sc.confHit}/${sc.confN}` : ''}</span>`);
+    if (learned) L.push(`<span class="m">Learning from ${learned}</span>`);
+    el.innerHTML = L.join('\n');
+  }
+  function drawFcBox() {
+    const el = $('fcLayer');
+    const p = FCS.pred, T = FCS.target;
+    if (!S.fc.on || !S.fc.box || !p || !p.ok || !C || T < 1) { el.innerHTML = ''; return; }
+    const ts = chart.timeScale();
+    const x = ts.logicalToCoordinate(T);
+    if (x === null) { el.innerHTML = ''; return; }
+    const y = v => candleSeries.priceToCoordinate(v);
+    const a = FCS.anchor;
+    const yo1 = y(a + p.up80), yo2 = y(a - p.dn80), yi1 = y(a + p.up50), yi2 = y(a - p.dn50), ym = y(a + p.move), ya = y(a);
+    if ([yo1, yo2, yi1, yi2, ym, ya].some(v => v === null)) { el.innerHTML = ''; return; }
+    const bs = ts.options().barSpacing;
+    const w = Math.max(14, bs * 1.6), left = Math.round(x - w / 2);
+    const cls = 'fc-' + leanOf(p);
+    const arrow = p.pUp >= 0.5 ? '▲' : '▼';
+    const lab = `${pct(Math.max(p.pUp, 1 - p.pUp))}${arrow}`;
+    el.innerHTML =
+      `<div class="fc-anchor" style="left:${left - 4}px;width:${w + 8}px;top:${Math.round(ya)}px"></div>` +
+      `<div class="fc-box outer ${cls}" style="left:${left}px;width:${w}px;top:${Math.round(yo1)}px;height:${Math.max(2, Math.round(yo2 - yo1))}px"></div>` +
+      `<div class="fc-box ${cls}" style="left:${left}px;width:${w}px;top:${Math.round(yi1)}px;height:${Math.max(2, Math.round(yi2 - yi1))}px"></div>` +
+      `<div class="fc-mid ${cls}" style="left:${left}px;width:${w}px;top:${Math.round(ym)}px;background:none"></div>` +
+      `<div class="fc-label ${cls}" style="left:${left + w + 4}px;top:${Math.round(yo1) - 2}px;background:none">${lab}</div>`;
+  }
+  // Long training history from MT5 (bridge builds the candles; the phone downloads little)
+  async function fetchTraining() {
+    if (!S.fc.on || !LIVE.bridge || !ticks || !symInfo()) return;
+    const end = Math.floor(ticks.t[0] / DAY) * DAY;
+    const days = Math.max(5, Math.min(60, +S.fc.days || 30));
+    const from = end - days * DAY;
+    const key = [LIVE.symInfo.name, S.tickSize, S.countMode, S.syncDay, end, days].join('|');
+    if (key === FCS.trainKey || FCS.loading) return;
+    FCS.loading = true; scheduleUI();
+    try {
+      const q = `symbol=${encodeURIComponent(LIVE.symInfo.name)}&from=${from}&to=${end}&size=${Math.max(2, +S.tickSize | 0)}&mode=${S.countMode}&sync=${S.syncDay ? 1 : 0}`;
+      const res = await (await api('api/candles?' + q)).json();
+      if (!ticks || Math.floor(ticks.t[0] / DAY) * DAY !== end) return;   // data changed meanwhile
+      FCS.train = res; FCS.trainKey = key;
+      FCS.trainDays = new Set(res.t.map(t => Math.floor(t / DAY))).size;
+      rebuildForecast(true);
+      render(false);
+    } catch (e) {
+      toast('Could not load training history for the forecast: ' + e.message, 6000);
+    } finally { FCS.loading = false; scheduleUI(); }
+  }
 
   // ====================================================================
   // Live mode (bridge)
@@ -1217,7 +1372,7 @@
     D.extendCandles(C, ticks);
     D.updateDays(days, ticks, n0);
     if (days.length !== dBefore) rebuildCPRMap();
-    if (C.n !== cBefore) rebuildMAs();
+    if (C.n !== cBefore) { rebuildMAs(); rebuildForecast(false); }
     render(false);
   }
   function onSnapshot(m) {
@@ -1302,9 +1457,10 @@
     applySeriesStyles();
     if (!ticks) return;
     if (JSON.stringify(S.firstHLC) !== beforeHLC) rebuildCPRMap();
-    if (JSON.stringify([S.countMode, S.syncDay]) !== before) rebuildCandles(); else rebuildMAs();
-    R.shownCi = -1;
+    if (JSON.stringify([S.countMode, S.syncDay]) !== before) rebuildCandles(); else { rebuildMAs(); rebuildForecast(true); }
+    R.shownCi = -1; FCS.target = -1;
     render(true);
+    fetchTraining();
     chart.applyOptions({});   // refresh time labels for a new time zone
   });
 
@@ -1332,7 +1488,7 @@
   detectBridge();
 
   window.TickChartApp = {
-    get ticks() { return ticks; }, get candles() { return C; }, R, TR, LIVE, HL, S,
+    get ticks() { return ticks; }, get candles() { return C; }, R, TR, LIVE, HL, S, FCS,
     setTicks, startReplayAt, advanceTo, marketOrder, placePending, addLine, startLive, stopLive, chart, candleSeries
   };
 })();

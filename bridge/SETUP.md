@@ -86,6 +86,7 @@ The key in the link is a second lock on top of Tailscale. Don't post it anywhere
 | **Buy Limit / Sell Limit** | Then tap the chart at your price. On the wrong side of the market, it becomes a Stop order. |
 | **Drag lines** | Drag S/L, T/P or a pending order to change it in MT5. Drag a **position's line** up or down to add a T/P or S/L. |
 | **─ Line** (key H) | Draws a support/resistance line. Tap a line to recolour or delete it. Lines are saved on the bridge, so the phone and the VPS show the same lines. |
+| **Next ⓘ** | Next-candle forecast: likely range (ghost box) and direction odds, learned from the last 30 days of MT5 history. The panel shows whether it has any real edge in testing. |
 | **Times** | Shown in Kitchener time (⚙ Settings → Time). The broker's trading day, which is used for CPR and day separators, starts at 17:00 Kitchener time. |
 
 The badge above the BUY/SELL buttons always tells you where orders go: **Paper (replay)**, **DEMO account**, or **LIVE account** (red).

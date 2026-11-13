@@ -148,8 +148,27 @@ body.bridge .no-bridge { display: none !important; }
 p.pre { white-space: pre-line; margin: 4px 0 2px; }
 #confirmDlg { max-width: 380px; }
 
-#btnInfo { position: absolute; right: 74px; top: 4px; z-index: 4; opacity: .8; }
-#btnInfo.active { opacity: 1; }
+#ovBtns { position: absolute; right: 74px; top: 4px; z-index: 4; display: flex; gap: 4px; }
+#ovBtns .btn { opacity: .8; }
+#ovBtns .btn.active { opacity: 1; background: #1f4f8f; border-color: var(--accent); }
+
+/* next-candle forecast */
+#fcLayer { position: absolute; inset: 0; pointer-events: none; z-index: 2; overflow: hidden; }
+.fc-box { position: absolute; border: 1px dashed; border-radius: 2px; }
+.fc-box.outer { opacity: .55; }
+.fc-mid { position: absolute; height: 0; border-top: 2px solid; }
+.fc-anchor { position: absolute; height: 0; border-top: 1px dotted #9aa3b5; }
+.fc-label { position: absolute; font: 600 11px Consolas, monospace; white-space: nowrap; text-shadow: 0 0 3px #000, 0 0 3px #000; }
+.fc-up { color: #2fd16b; border-color: #2fd16b; background: rgba(47, 209, 107, .10); }
+.fc-down { color: #ff5c5c; border-color: #ff5c5c; background: rgba(255, 92, 92, .10); }
+.fc-flat { color: #9fb6d9; border-color: #7f9cc9; background: rgba(127, 156, 201, .10); }
+#fcPanel {
+  position: absolute; left: 6px; bottom: 34px; z-index: 3; pointer-events: none; max-width: min(560px, calc(100% - 90px));
+  font-family: Consolas, "Courier New", monospace; font-size: 11.5px; line-height: 1.35; white-space: pre-wrap;
+  background: rgba(0, 0, 0, .66); padding: 4px 7px; border-radius: 3px; border: 1px solid #2a2e37; text-shadow: 0 0 3px #000;
+}
+#fcPanel .w { color: #e6e6e6; } #fcPanel .g { color: #2fd16b; } #fcPanel .r { color: #ff5c5c; }
+#fcPanel .o { color: #ffa726; } #fcPanel .m { color: #8b909b; } #fcPanel .b { color: #9fb6d9; }
 #infoPanel { top: 30px; }
 
 #lineMenu {
@@ -194,7 +213,8 @@ p.pre { white-space: pre-line; margin: 4px 0 2px; }
   #panelHead { flex-wrap: nowrap; align-items: flex-start; padding-top: 2px; }
   .tabs { flex-shrink: 0; }
   #infoPanel { font-size: 10px; right: 64px; top: auto; bottom: 34px; }
-  #btnInfo { right: 64px; }
+  #ovBtns { right: 64px; }
+  #fcPanel { font-size: 10px; bottom: 34px; max-width: calc(100% - 70px); }
   #legend { display: block; margin: 2px 0 0; }
   #oneClick { top: 40px; }
   .oc { min-width: 84px; padding: 4px 8px; }

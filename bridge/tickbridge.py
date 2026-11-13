@@ -26,7 +26,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-VERSION = "1.0"
+VERSION = "1.1"
 HERE = Path(__file__).resolve().parent
 APP_ROOT = HERE.parent
 CONFIG_PATH = HERE / "config.json"
@@ -277,6 +277,88 @@ async def api_prevday(request):
         b = bars[-1]
         return {"time": int(b["time"]) * 1000, "h": float(b["high"]), "l": float(b["low"]), "c": float(b["close"])}
     return web.json_response(await call(work))
+
+
+CANDLE_CACHE = {}
+
+
+def build_tick_candles(times, bids, flags, size, count_mode, sync_day):
+    """Tick candles, exactly like js/data.js extendCandles(). Returns column lists."""
+    T, O, H, L, Cc, DUR = [], [], [], [], [], []
+    bid_only = count_mode == "bid"
+    count, cur_day, prev_bid = 0, None, None
+    t0 = 0
+    for t, b, f in zip(times, bids, flags):
+        day = t // 86400000
+        counts = (not bid_only) or (f & 2) or b != prev_bid
+        prev_bid = b
+        if not T or (sync_day and day != cur_day) or (count >= size and counts):
+            if T:
+                DUR[-1] = last_t - t0
+            T.append(t); O.append(b); H.append(b); L.append(b); Cc.append(b); DUR.append(0)
+            t0, count, cur_day = t, 0, day
+        if b > H[-1]:
+            H[-1] = b
+        if b < L[-1]:
+            L[-1] = b
+        Cc[-1] = b
+        last_t = t
+        if counts:
+            count += 1
+    if T:
+        DUR[-1] = last_t - t0
+    return {"t": T, "o": O, "h": H, "l": L, "c": Cc, "dur": DUR}
+
+
+async def api_candles(request):
+    """Tick candles for a long period (training data for the forecast), built here so the phone downloads little."""
+    q = request.query
+    symbol = q.get("symbol", "")
+    if symbol not in CFG["symbols"]:
+        raise web.HTTPBadRequest(text=f"Unknown symbol {symbol}")
+    try:
+        frm, to, size = int(q["from"]), int(q["to"]), max(2, int(q.get("size", "50")))
+    except (KeyError, ValueError):
+        raise web.HTTPBadRequest(text="from, to and size are required")
+    if to <= frm or to - frm > 62 * 86400000:
+        raise web.HTTPBadRequest(text="Choose a range of at most 62 days")
+    mode = "bid" if q.get("mode") == "bid" else "all"
+    sync = q.get("sync", "1") != "0"
+    key = (symbol, frm // 60000, to // 60000, size, mode, sync)
+    if key in CANDLE_CACHE:
+        return web.json_response(CANDLE_CACHE[key])
+
+    def work():
+        mt5.symbol_select(symbol, True)
+        si = mt5.symbol_info(symbol)
+        times, bids, flags = [], [], []
+        cs = frm
+        while cs < to:
+            ce = min(cs + 86400000, to)
+            arr = None
+            for _ in range(10):
+                arr = mt5.copy_ticks_range(symbol, cs // 1000, ce // 1000 + 1, mt5.COPY_TICKS_ALL)
+                if arr is not None:
+                    break
+                time.sleep(0.4)
+            if arr is not None and len(arr):
+                tm = arr["time_msc"]
+                keep = (tm >= cs) & (tm < ce)
+                times.extend(int(x) for x in tm[keep])
+                bids.extend(round(float(x), si.digits) for x in arr["bid"][keep])
+                flags.extend(int(x) for x in arr["flags"][keep])
+            cs = ce
+        res = build_tick_candles(times, bids, flags, size, mode, sync)
+        res.update(symbol=symbol, digits=si.digits, ticks=len(times))
+        log.info("Training candles %s: %d ticks -> %d candles (%d-tick)", symbol, len(times), len(res["t"]), size)
+        return res
+    res = await call(work)
+    if len(CANDLE_CACHE) > 20:
+        CANDLE_CACHE.clear()
+    CANDLE_CACHE[key] = res
+    resp = web.json_response(res)
+    resp.enable_compression()
+    return resp
 
 
 def lines_path(symbol):
@@ -557,6 +639,7 @@ def main():
     app.router.add_get("/api/info", api_info)
     app.router.add_get("/api/ticks", api_ticks)
     app.router.add_get("/api/prevday", api_prevday)
+    app.router.add_get("/api/candles", api_candles)
     app.router.add_get("/api/lines", api_lines_get)
     app.router.add_put("/api/lines", api_lines_put)
     app.router.add_post("/api/trade", api_trade)
