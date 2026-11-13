@@ -27,8 +27,9 @@
   }
 
   /* data: { n, o, h, l, c, t, dur } candles (oldest first), t = open time (server ms), dur = ms.
-     cfg:  { ma1: {type, period}, ma2: {type, period} } */
+     cfg:  { ma1: {type, period}, ma2: {type, period}, horizon: candles ahead (1..), spread: points } */
   function prepare(data, cfg) {
+    const H = Math.max(1, +cfg.horizon | 0 || 1);
     const { n, o, h, l, c, t, dur } = data;
     const D = global.TickData;
     const rng = new Float64Array(n), logDur = new Float64Array(n), day = new Int32Array(n);
@@ -74,18 +75,21 @@
       valid[i] = 1;
     }
 
-    // outcomes of the NEXT candle, in units of the current ATR (adapts to quiet / busy markets)
+    // outcomes over the next H candles, in units of the current ATR (adapts to quiet / busy markets):
+    // close after H candles, highest high and lowest low within them
     const has = new Uint8Array(n), up = new Uint8Array(n);
     const mv = new Float32Array(n), ux = new Float32Array(n), dx = new Float32Array(n), rg = new Float32Array(n);
-    for (let i = WARM; i < n - 1; i++) {
-      if (!valid[i] || day[i + 1] !== day[i]) continue;     // skip day boundaries (overnight gaps)
+    for (let i = WARM; i < n - H; i++) {
+      if (!valid[i] || day[i + H] !== day[i]) continue;     // skip windows crossing a day boundary (overnight gaps)
       const A = atr[i];
+      let hi = -Infinity, lo = Infinity;
+      for (let k = i + 1; k <= i + H; k++) { if (h[k] > hi) hi = h[k]; if (l[k] < lo) lo = l[k]; }
       has[i] = 1;
-      up[i] = c[i + 1] > c[i] ? 1 : 0;
-      mv[i] = (c[i + 1] - c[i]) / A;
-      ux[i] = Math.max(0, h[i + 1] - c[i]) / A;
-      dx[i] = Math.max(0, c[i] - l[i + 1]) / A;
-      rg[i] = (h[i + 1] - l[i + 1]) / A;
+      up[i] = c[i + H] > c[i] ? 1 : 0;
+      mv[i] = (c[i + H] - c[i]) / A;
+      ux[i] = Math.max(0, hi - c[i]) / A;
+      dx[i] = Math.max(0, c[i] - lo) / A;
+      rg[i] = (hi - lo) / A;
     }
     // prefix sums for the normal (unconditional) up-rate before any index
     const cumN = new Int32Array(n + 1), cumUp = new Int32Array(n + 1);
@@ -100,7 +104,7 @@
     for (let d = 0; d < DIM; d++) sd[d] = Math.sqrt(sd[d] / Math.max(1, cnt - 1)) || 1;
     for (let i = 0; i < n; i++) if (valid[i]) for (let d = 0; d < DIM; d++) F[i * DIM + d] = (F[i * DIM + d] - mean[d]) / sd[d] * WEIGHT[d];
 
-    return { n, F, valid, has, up, mv, ux, dx, rg, atr, cumN, cumUp, close: c, day, scratch: { dist: new Float32Array(n), idx: new Int32Array(n) } };
+    return { n, H, spread: +cfg.spread || 0, F, valid, has, up, mv, ux, dx, rg, atr, cumN, cumUp, close: c, day, scratch: { dist: new Float32Array(n), idx: new Int32Array(n) } };
   }
 
   // quickselect: move the k smallest dist values (by index list) to the front
@@ -124,8 +128,8 @@
     return a[b] + (a[Math.min(a.length - 1, b + 1)] - a[b]) * (pos - b);
   }
 
-  /* Forecast the candle after index i, learning only from samples j <= jMax
-     (sample j's outcome is candle j+1, so jMax must be <= i-1 to avoid peeking). */
+  /* Forecast the next H candles after index i, learning only from samples j <= jMax
+     (sample j's outcome ends at candle j+H, so jMax must be <= i-H to avoid peeking). */
   function predict(M, i, jMax, opts) {
     if (i < 0 || i >= M.n || !M.valid[i]) return { ok: false, reason: 'not enough candles yet for a pattern' };
     jMax = Math.min(jMax, M.n - 2);
@@ -150,7 +154,8 @@
     }
     const pUp = ups / K;
     const baseUp = M.cumUp[jMax + 1] / Math.max(1, M.cumN[jMax + 1]);
-    const se = Math.sqrt(Math.max(0.01, baseUp * (1 - baseUp)) / K);
+    // neighbours' H-candle outcomes overlap in time, so they are not independent: widen the error by sqrt(H)
+    const se = Math.sqrt(Math.max(0.01, baseUp * (1 - baseUp)) / K) * Math.sqrt(M.H);
     const A = M.atr[i];
     return {
       ok: true, N, K, pUp, baseUp, se, z: (pUp - baseUp) / se,
@@ -169,19 +174,23 @@
     for (let j = WARM; j < Math.min(endIdx, M.n - 1); j++) if (M.valid[j] && M.has[j]) list.push(j);
     if (list.length < 800) return { ok: false, reason: `needs at least 800 patterns, have ${list.length}. Load more days.` };
     const split = list[Math.floor(list.length * 0.7)];
+    const trainMax = split - 1 - M.H;          // training outcomes must end before the test period starts
     const testsAll = list.filter(j => j > split);
     const step = Math.max(1, Math.floor(testsAll.length / 500));
     const tests = testsAll.filter((_, k) => k % step === 0);
     let n = 0, hit = 0, baseHit = 0, confN = 0, confHit = 0, brier = 0, brierBase = 0, cov80 = 0, cov50 = 0, errModel = 0, errNaive = 0;
+    let pnlAll = 0, pnlConf = 0;   // points per trade if you traded every call / only the leans, after the spread
     for (let k = 0; k < tests.length; k++) {
       const j = tests[k];
-      const p = predict(M, j, split - 1, { minSamples: 100 });
+      const p = predict(M, j, trainMax, { minSamples: 100 });
       if (!p.ok) continue;
       const y = M.up[j];
       n++;
       if ((p.pUp > 0.5 ? 1 : 0) === y) hit++;
+      const movePts = M.mv[j] * M.atr[j];
+      pnlAll += (p.pUp > 0.5 ? movePts : -movePts) - M.spread;
       if ((p.baseUp > 0.5 ? 1 : 0) === y) baseHit++;
-      if (Math.abs(p.z) >= 2) { confN++; if ((p.pUp > p.baseUp ? 1 : 0) === y) confHit++; }
+      if (Math.abs(p.z) >= 2) { confN++; if ((p.pUp > p.baseUp ? 1 : 0) === y) confHit++; pnlConf += (p.pUp > p.baseUp ? movePts : -movePts) - M.spread; }
       brier += (p.pUp - y) ** 2; brierBase += (p.baseUp - y) ** 2;
       cov80 += (M.ux[j] <= p._ux80 ? 0.5 : 0) + (M.dx[j] <= p._dx80 ? 0.5 : 0);
       cov50 += (M.ux[j] <= p._ux50 ? 0.5 : 0) + (M.dx[j] <= p._dx50 ? 0.5 : 0);
@@ -196,6 +205,7 @@
       cov80: cov80 / n, cov50: cov50 / n,
       rangeGain: 1 - errModel / errNaive,
       edge: acc - 0.5 > ci && brier < brierBase,
+      pnlAll: pnlAll / n, pnlConf: confN ? pnlConf / confN : NaN, spread: M.spread, H: M.H,
       trainedOn: list.length - testsAll.length
     };
   }

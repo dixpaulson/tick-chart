@@ -96,6 +96,7 @@ It then finds the most similar moments in history and shows what the **next** ca
 - **Panel** (**Next ⓘ**): up/down odds compared with the normal rate, the likely range in points, and how many past patterns it is based on. It only says "leans UP/DOWN" when the difference is statistically meaningful.
 - **Test on unseen data**: the method learns from the first 70% of the history and is graded on the remaining 30%. If direction accuracy can't beat a coin flip, it says **no reliable edge**.
 - **Scorecard**: during replay or live, it counts how often the forecast was right.
+- **Horizon** (selector beside **Next ⓘ**, or Settings): forecast the next 1, 3, 5 or 10 candles. That covers the close after N candles and the high/low reached within them. The box spans those N candles. The test also reports the points per trade you would have made by trading only the leans, **after the spread**.
 - **No peeking**: a forecast only learns from candles that had finished before it. In replay, the future is never used.
 - **More history = better statistics.** With the bridge, it learns from the last 30 days of MT5 history (Settings: 10–60 days). With files, it uses the days you loaded.
 

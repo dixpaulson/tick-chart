@@ -150,6 +150,7 @@ p.pre { white-space: pre-line; margin: 4px 0 2px; }
 
 #ovBtns { position: absolute; right: 74px; top: 4px; z-index: 4; display: flex; gap: 4px; }
 #ovBtns .btn { opacity: .8; }
+#ovBtns select.small { padding: 1px 4px; font-size: 11px; }
 #ovBtns .btn.active { opacity: 1; background: #1f4f8f; border-color: var(--accent); }
 
 /* next-candle forecast */

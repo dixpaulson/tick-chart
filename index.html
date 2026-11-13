@@ -60,6 +60,7 @@
     <div id="daySeps"></div>
     <div id="chartTitle"><span id="titleSym">No data loaded</span> <span id="legend"></span></div>
     <div id="ovBtns">
+      <select id="fcH" class="small" title="Forecast horizon: how many candles ahead"><option value="1">1 candle</option><option value="3">3 candles</option><option value="5">5 candles</option><option value="10">10 candles</option></select>
       <button id="btnFc" class="btn small" title="Show / hide the next-candle forecast panel">Next ⓘ</button>
       <button id="btnInfo" class="btn small" title="Show / hide the CPR panel">CPR ⓘ</button>
     </div>
@@ -167,6 +168,8 @@
         <legend>Next-candle forecast</legend>
         <label><input type="checkbox" name="fc.on"> Pattern-match forecast</label>
         <label><input type="checkbox" name="fc.box"> Ghost box on the chart</label>
+        <label>Forecast horizon
+          <select name="fc.horizon"><option value="1">next candle</option><option value="3">next 3 candles</option><option value="5">next 5 candles</option><option value="10">next 10 candles</option></select></label>
         <label>With the bridge, learn from the last
           <select name="fc.days"><option value="10">10 days</option><option value="20">20 days</option><option value="30">30 days</option><option value="45">45 days</option><option value="60">60 days</option></select></label>
         <p class="muted">Finds the most similar past moments (candle shapes, momentum, MAs, CPR, volatility, speed, time of day) and shows what the next candle did after them. Odds, not promises: check the "test on unseen data" line before trusting it.</p>

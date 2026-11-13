@@ -21,7 +21,7 @@
     vppBySymbol: {}, curBySymbol: {},
     speedMode: 'tick', speeds: { tick: 50, candle: 2, time: 10 },
     liveSymbol: '', infoOpen: true, panelOpen: true,
-    fc: { on: true, box: true, panel: true, days: 30 }
+    fc: { on: true, box: true, panel: true, days: 30, horizon: 1 }
   };
   const SPEEDS = {
     tick: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
@@ -58,7 +58,7 @@
   const HL = { list: [], selected: null, symbol: '' };
   // next-candle forecast state
   const FCS = { model: null, offset: 0, train: null, trainKey: '', trainDays: 0, loading: false, val: null, valProgress: -1, valToken: 0,
-    pred: null, target: -1, anchor: NaN, score: { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0 } };
+    pred: null, target: -1, anchor: NaN, pending: [], score: { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0 } };
 
   const symbolKey = () => (ticks ? ticks.symbol.replace(/\s*\(demo\)/, '').toUpperCase() : '');
   const symInfo = () => (LIVE.symInfo && ticks && LIVE.symInfo.name.toUpperCase() === symbolKey()) ? LIVE.symInfo : null;
@@ -1128,6 +1128,12 @@
   function applyPanel() { $('panel').classList.toggle('collapsed', !S.panelOpen); $('btnPanel').textContent = S.panelOpen ? '▾' : '▴'; }
   $('btnPanel').addEventListener('click', () => { S.panelOpen = !S.panelOpen; applyPanel(); saveSettings(); });
   $('btnInfo').addEventListener('click', () => { S.infoOpen = !S.infoOpen; if (S.infoOpen && narrowScreen()) S.fc.panel = false; saveSettings(); scheduleUI(); });
+  const fcHEl = $('fcH');
+  fcHEl.value = String(horizon());
+  fcHEl.addEventListener('change', () => {
+    S.fc.horizon = +fcHEl.value; saveSettings(); fcHEl.blur();
+    resetScore(); rebuildForecast(true); FCS.target = -1; render(false);
+  });
   $('btnFc').addEventListener('click', () => { S.fc.panel = !S.fc.panel; if (S.fc.panel && narrowScreen()) S.infoOpen = false; saveSettings(); scheduleUI(); });
   applyPanel();
 
@@ -1135,7 +1141,16 @@
   // Next-candle forecast (pattern matching — see js/forecast.js)
   // ====================================================================
   const FC = TickForecast;
-  function resetScore() { FCS.score = { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0 }; }
+  function resetScore() { FCS.score = { n: 0, hit: 0, cov: 0, confN: 0, confHit: 0, pnl: 0 }; FCS.pending = []; }
+  function horizon() { return Math.max(1, Math.min(20, +S.fc.horizon | 0 || 1)); }
+  // typical spread (points) of the loaded ticks, used to judge results after costs
+  function typicalSpread() {
+    if (!ticks || !ticks.n) return 0;
+    const step = Math.max(1, Math.floor(ticks.n / 4000)), a = [];
+    for (let i = 0; i < ticks.n; i += step) a.push(ticks.ask[i] - ticks.bid[i]);
+    a.sort((x, y) => x - y);
+    return a[Math.floor(a.length / 2)] || 0;
+  }
   // Training candles (bridge) + the loaded candles, as one series for the pattern search.
   function fcData() {
     const tr = FCS.train;
@@ -1153,7 +1168,7 @@
   function rebuildForecast(full) {
     if (!S.fc.on || !C || !ticks) { FCS.model = null; FCS.pred = null; return; }
     const { data, offset } = fcData();
-    FCS.model = FC.prepare(data, { ma1: S.ma1, ma2: S.ma2 });
+    FCS.model = FC.prepare(data, { ma1: S.ma1, ma2: S.ma2, horizon: horizon(), spread: typicalSpread() });
     FCS.offset = offset;
     if (full) { FCS.target = -1; FCS.pred = null; runValidation(); }
   }
@@ -1180,34 +1195,52 @@
     if (!S.fc.on || !FCS.model) { FCS.pred = null; return; }
     const T = fcTarget();
     if (T === FCS.target) return;
-    // score the forecast for the candle that just finished
-    const P = FCS.target;
-    if (tail() && FCS.pred && FCS.pred.ok && P >= 1 && T > P && P < C.n && C.day[P] === C.day[P - 1]) {
-      const a = FCS.anchor, y = C.c[P] > a, sc = FCS.score;
-      sc.n++;
-      if ((FCS.pred.pUp > 0.5) === y) sc.hit++;
-      sc.cov += ((C.h[P] - a) <= FCS.pred.up80 ? 0.5 : 0) + ((a - C.l[P]) <= FCS.pred.dn80 ? 0.5 : 0);
-      if (Math.abs(FCS.pred.z) >= 2) { sc.confN++; if ((FCS.pred.pUp > FCS.pred.baseUp) === y) sc.confHit++; }
+    // score earlier forecasts whose whole window of H candles has now finished (replay / live only)
+    if (tail() && FCS.pending.length) {
+      const lastDone = T - 1;
+      FCS.pending = FCS.pending.filter(q => {
+        const E = q.T + q.H - 1;
+        if (E > lastDone || E >= C.n) return E <= lastDone + 50;   // keep waiting (drop if replay jumped back)
+        if (C.day[E] !== C.day[q.T - 1]) return false;              // window crossed a day boundary
+        let hi = -Infinity, lo = Infinity;
+        for (let k = q.T; k <= E; k++) { if (C.h[k] > hi) hi = C.h[k]; if (C.l[k] < lo) lo = C.l[k]; }
+        const a = q.anchor, y = C.c[E] > a, sc = FCS.score, p = q.pred;
+        sc.n++;
+        if ((p.pUp > 0.5) === y) sc.hit++;
+        sc.cov += ((hi - a) <= p.up80 ? 0.5 : 0) + ((a - lo) <= p.dn80 ? 0.5 : 0);
+        if (Math.abs(p.z) >= 2) {
+          sc.confN++;
+          const long = p.pUp > p.baseUp;
+          if (long === y) sc.confHit++;
+          sc.pnl += (long ? C.c[E] - a : a - C.c[E]) - (FCS.model ? FCS.model.spread : 0);
+        }
+        return false;
+      });
     }
+    if (!tail()) FCS.pending = [];
     FCS.target = T;
     if (T < 1) { FCS.pred = { ok: false, reason: 'not enough candles yet' }; return; }
     const iNow = FCS.offset + T - 1;              // last finished candle
     FCS.anchor = C.c[T - 1];
     FCS.newDay = T < C.n && C.day[T] !== C.day[T - 1];
-    FCS.pred = FC.predict(FCS.model, iNow, iNow - 1);   // learns only from outcomes known by now
+    const H = FCS.model.H;
+    FCS.pred = FC.predict(FCS.model, iNow, iNow - H);   // learns only from outcomes that had finished by now
+    if (tail() && FCS.pred.ok && T < C.n + 1) FCS.pending.push({ T, H, pred: FCS.pred, anchor: FCS.anchor });
+    if (FCS.pending.length > 100) FCS.pending.shift();
   }
   const pct = x => (x * 100).toFixed(0) + '%';
   function leanOf(p) { return p.z >= 2 ? 'up' : p.z <= -2 ? 'down' : 'flat'; }
   function drawFcPanel() {
     const el = $('fcPanel');
     $('btnFc').classList.toggle('active', !!(S.fc.on && S.fc.panel));
-    $('btnFc').classList.toggle('hidden', !S.fc.on);
+    $('btnFc').classList.toggle('hidden', !S.fc.on); $('fcH').classList.toggle('hidden', !S.fc.on);
     if (!S.fc.on || !S.fc.panel || !C) { el.classList.add('hidden'); return; }
     el.classList.remove('hidden');
     const L = [];
     const p = FCS.pred, v = FCS.val;
     const learned = FCS.model ? `${(FCS.model.n).toLocaleString()} candles${FCS.trainDays ? ` (${FCS.trainDays} days from MT5 + loaded)` : ' (loaded data)'}` : '';
-    L.push(`<span class="w">NEXT CANDLE · pattern match</span>${FCS.loading ? '  <span class="o">learning from MT5 history…</span>' : ''}`);
+    const H = horizon(), what = H === 1 ? 'NEXT CANDLE' : `NEXT ${H} CANDLES`;
+    L.push(`<span class="w">${what} · pattern match</span>${FCS.loading ? '  <span class="o">learning from MT5 history…</span>' : ''}`);
     if (!p || !p.ok) {
       L.push(`<span class="m">${p ? p.reason : 'waiting for data'}.</span>`);
       if (!FCS.train) L.push(`<span class="m">${LIVE.bridge ? 'Loading more history from MT5…' : 'Load more days (or use the bridge) for a forecast.'}</span>`);
@@ -1215,19 +1248,24 @@
       const lean = leanOf(p);
       const cls = lean === 'up' ? 'g' : lean === 'down' ? 'r' : 'b';
       const verdict = lean === 'up' ? 'leans UP' : lean === 'down' ? 'leans DOWN' : 'no clear edge';
-      L.push(`<span class="${cls}">Up ${pct(p.pUp)}  Down ${pct(1 - p.pUp)}   (normal ${pct(p.baseUp)} up) → ${verdict}</span>`);
-      L.push(`<span class="w">Likely range  50%: +${p.up50.toFixed(1)} / −${p.dn50.toFixed(1)}   80%: +${p.up80.toFixed(1)} / −${p.dn80.toFixed(1)} pts</span>`);
-      L.push(`<span class="m">Avg move after similar: ${p.move >= 0 ? '+' : ''}${p.move.toFixed(1)} pts · ${p.K} most similar of ${p.N.toLocaleString()} past candles${FCS.newDay ? ' · new day: less reliable' : ''}</span>`);
+      L.push(`<span class="${cls}">${H === 1 ? '' : `After ${H} candles: `}Up ${pct(p.pUp)}  Down ${pct(1 - p.pUp)}   (normal ${pct(p.baseUp)} up) → ${verdict}</span>`);
+      L.push(`<span class="w">${H === 1 ? 'Likely range' : `High/low within ${H}`}  50%: +${p.up50.toFixed(1)} / −${p.dn50.toFixed(1)}   80%: +${p.up80.toFixed(1)} / −${p.dn80.toFixed(1)} pts</span>`);
+      const sp = FCS.model ? FCS.model.spread : 0;
+      L.push(`<span class="m">Avg move after similar: ${p.move >= 0 ? '+' : ''}${p.move.toFixed(1)} pts (spread ${sp.toFixed(1)}) · ${p.K} most similar of ${p.N.toLocaleString()} past patterns${FCS.newDay ? ' · new day: less reliable' : ''}</span>`);
     }
     if (FCS.valProgress >= 0) L.push(`<span class="m">Testing on unseen data… ${pct(FCS.valProgress)}</span>`);
     else if (v && !v.ok) L.push(`<span class="m">Test: ${v.reason}</span>`);
     else if (v && v.ok) {
       const dirTxt = v.edge ? `<span class="g">direction ${pct(v.acc)} right (coin 50%) → some edge</span>` : `<span class="o">direction ${pct(v.acc)} right (coin 50%) → no reliable edge</span>`;
       const covOk = Math.abs(v.cov80 - 0.8) <= 0.06;
-      L.push(`<span class="m">Test on ${v.n} unseen candles:</span> ${dirTxt} <span class="m">·</span> <span class="${covOk ? 'g' : 'o'}">range band held ${pct(v.cov80)} (aim 80%)</span>`);
+      L.push(`<span class="m">Test on ${v.n} unseen:</span> ${dirTxt} <span class="m">·</span> <span class="${covOk ? 'g' : 'o'}">range band held ${pct(v.cov80)} (aim 80%)</span>`);
+      if (v.confN >= 10) {
+        const ok = v.pnlConf > 0;
+        L.push(`<span class="m">Trading only the leans (${v.confN}×, ${pct(v.confAcc)} right):</span> <span class="${ok ? 'g' : 'r'}">${v.pnlConf >= 0 ? '+' : ''}${v.pnlConf.toFixed(1)} pts per trade after spread</span>`);
+      } else L.push(`<span class="m">Too few confident leans in the test (${v.confN}) to judge trading them.</span>`);
     }
     const sc = FCS.score;
-    if (tail() && sc.n) L.push(`<span class="w">This ${R.active ? 'replay' : 'session'}: ${sc.hit}/${sc.n} direction right (${pct(sc.hit / sc.n)}) · band held ${pct(sc.cov / sc.n)}${sc.confN ? ` · when leaning: ${sc.confHit}/${sc.confN}` : ''}</span>`);
+    if (tail() && sc.n) L.push(`<span class="w">This ${R.active ? 'replay' : 'session'}: ${sc.hit}/${sc.n} direction right (${pct(sc.hit / sc.n)}) · band held ${pct(sc.cov / sc.n)}${sc.confN ? ` · leans: ${sc.confHit}/${sc.confN}, ${sc.pnl >= 0 ? '+' : ''}${sc.pnl.toFixed(1)} pts after spread` : ''}</span>`);
     if (learned) L.push(`<span class="m">Learning from ${learned}</span>`);
     el.innerHTML = L.join('\n');
   }
@@ -1242,11 +1280,13 @@
     const a = FCS.anchor;
     const yo1 = y(a + p.up80), yo2 = y(a - p.dn80), yi1 = y(a + p.up50), yi2 = y(a - p.dn50), ym = y(a + p.move), ya = y(a);
     if ([yo1, yo2, yi1, yi2, ym, ya].some(v => v === null)) { el.innerHTML = ''; return; }
-    const bs = ts.options().barSpacing;
-    const w = Math.max(14, bs * 1.6), left = Math.round(x - w / 2);
+    const bs = ts.options().barSpacing, H = FCS.model ? FCS.model.H : 1;
+    const xEnd = ts.logicalToCoordinate(T + H - 1);
+    const span = (xEnd !== null ? xEnd - x : (H - 1) * bs) + bs;
+    const w = Math.max(14, H === 1 ? bs * 1.6 : span), left = Math.round(H === 1 ? x - w / 2 : x - bs / 2);
     const cls = 'fc-' + leanOf(p);
     const arrow = p.pUp >= 0.5 ? '▲' : '▼';
-    const lab = `${pct(Math.max(p.pUp, 1 - p.pUp))}${arrow}`;
+    const lab = `${H > 1 ? H + ': ' : ''}${pct(Math.max(p.pUp, 1 - p.pUp))}${arrow}`;
     el.innerHTML =
       `<div class="fc-anchor" style="left:${left - 4}px;width:${w + 8}px;top:${Math.round(ya)}px"></div>` +
       `<div class="fc-box outer ${cls}" style="left:${left}px;width:${w}px;top:${Math.round(yo1)}px;height:${Math.max(2, Math.round(yo2 - yo1))}px"></div>` +
@@ -1459,6 +1499,7 @@
     if (JSON.stringify(S.firstHLC) !== beforeHLC) rebuildCPRMap();
     if (JSON.stringify([S.countMode, S.syncDay]) !== before) rebuildCandles(); else { rebuildMAs(); rebuildForecast(true); }
     R.shownCi = -1; FCS.target = -1;
+    $('fcH').value = String(horizon());
     render(true);
     fetchTraining();
     chart.applyOptions({});   // refresh time labels for a new time zone
