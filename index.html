@@ -9,7 +9,8 @@
 <body>
 <header id="toolbar">
   <div class="group">
-    <label class="btn" title="Open an MT5 tick export (.csv / .txt)">📂 Open ticks<input type="file" id="fileInput" accept=".csv,.txt,.tsv" hidden></label>
+    <label class="btn" title="Open one or more MT5 tick exports (.csv / .txt). Select several files to combine days.">📂 Open ticks<input type="file" id="fileInput" accept=".csv,.txt,.tsv" multiple hidden></label>
+    <label class="btn hidden" id="addBtn" title="Add more days (same symbol) to the loaded data">➕ Add days<input type="file" id="addInput" accept=".csv,.txt,.tsv" multiple hidden></label>
     <select id="demoSelect" title="Load generated demo data to try the app">
       <option value="">Demo data…</option>
       <option value="GER40">GER40 demo</option>
@@ -58,7 +59,7 @@
     <div id="hint" class="hidden"></div>
     <div id="emptyMsg">
       <h2>Tick Chart</h2>
-      <p>Open or drop an MT5 tick export file (<code>.csv</code> / <code>.txt</code>) to begin.</p>
+      <p>Open or drop one or more MT5 tick export files (<code>.csv</code> / <code>.txt</code>) to begin. Several files (e.g. one per day) are combined.</p>
       <p class="muted">Use the <b>ExportTicks</b> script in the <code>mql5</code> folder, or MT5 → View → Symbols → Ticks → Export.<br>No file yet? Pick <b>Demo data</b> above.</p>
     </div>
     <div id="busy" class="hidden">Loading…</div>

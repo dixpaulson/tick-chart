@@ -16,6 +16,13 @@ An MT5-style **historical tick chart** viewer with **replay** and **paper tradin
 3. Open your tick file with **📂 Open ticks**, or drag it onto the page.
    No file yet? Choose **Demo data** to try the app.
 
+### Loading several days
+
+- **📂 Open ticks** lets you select several files at once (Ctrl/Shift-click). For example, pick one MT5 export per day, and they're combined into one chart.
+- Once data is loaded, **➕ Add days** (or dropping more files onto the chart) adds files to what is already there.
+- Files can be in any order and may overlap; duplicate ticks are removed. All files must be for the same symbol.
+- Load the day **before** the first day you want to study, so that day also gets its CPR.
+
 ## Getting tick data out of MT5
 
 ### Option A: ExportTicks script (recommended)

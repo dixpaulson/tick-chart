@@ -326,37 +326,55 @@
     $('emptyMsg').classList.add('hidden');
     const jd = $('jumpDate');
     jd.min = toInputValue(ticks.t[0]); jd.max = toInputValue(ticks.t[ticks.n - 1]);
-    if (!jd.value) jd.value = toInputValue(ticks.t[0]);
+    const jv = fromInputValue(jd.value);
+    if (!(jv >= ticks.t[0] && jv <= ticks.t[ticks.n - 1])) jd.value = toInputValue(ticks.t[0]);
+    $('addBtn').classList.toggle('hidden', !sources.length);
     render(true);
     chart.timeScale().scrollToRealTime();
     const noCpr = days.length && !cprMap.get(days[0].day);
-    toast(`Loaded ${ticks.n.toLocaleString()} ticks, ${days.length} day(s) of ${ticks.symbol}` + (noCpr ? ' — first day has no CPR (no previous day)' : ''), 4000);
+    const dayList = days.map(d => { const x = new Date(d.day * D.DAY_MS); return `${DOW[x.getUTCDay()]} ${x.getUTCDate()} ${MON[x.getUTCMonth()]}`; }).join(', ');
+    toast(`Loaded ${ticks.n.toLocaleString()} ticks of ${ticks.symbol}: ${dayList}` + (noCpr ? ' — first day has no CPR (no previous day)' : ''), 5000);
   }
 
-  function loadFile(file) {
-    if (!file) return;
+  // Loaded source files (one parsed tick set each). "Add" merges new files with these.
+  let sources = [];
+  const baseSym = s => String(s || '').replace(/\s*\(demo\)/, '').toUpperCase();
+
+  async function loadFiles(fileList, add) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
     busy(true);
-    const reader = new FileReader();
-    reader.onerror = () => { busy(false); toast('Could not read file'); };
-    reader.onload = () => {
-      setTimeout(() => {
-        try { setTicks(D.parseTicks(D.decodeBuffer(reader.result), file.name)); }
-        catch (e) { console.error(e); toast('Error: ' + e.message, 5000); }
-        finally { busy(false); }
-      }, 20);
-    };
-    reader.readAsArrayBuffer(file);
+    await new Promise(r => setTimeout(r, 20));
+    try {
+      const parsed = [];
+      for (const f of files) {
+        try { parsed.push(D.parseTicks(D.decodeBuffer(await f.arrayBuffer()), f.name)); }
+        catch (e) { console.error(e); toast(`${f.name}: ${e.message}`, 5000); }
+      }
+      if (!parsed.length) return;
+      const syms = new Set(parsed.map(p => baseSym(p.symbol)));
+      if (add && ticks && sources.length) syms.add(baseSym(sources[0].symbol));
+      if (syms.size > 1) {
+        toast(`These files are for different symbols (${[...syms].join(', ')}). Load one symbol at a time.`, 6000);
+        return;
+      }
+      sources = (add && sources.length) ? sources.concat(parsed) : parsed;
+      setTicks(D.mergeTicks(sources));
+    } finally { busy(false); }
   }
-  $('fileInput').addEventListener('change', e => { loadFile(e.target.files[0]); e.target.value = ''; });
+  $('fileInput').addEventListener('change', e => { loadFiles(e.target.files, false); e.target.value = ''; });
+  $('addInput').addEventListener('change', e => { loadFiles(e.target.files, true); e.target.value = ''; });
   $('demoSelect').addEventListener('change', e => {
     const v = e.target.value; e.target.value = '';
     if (!v) return;
     busy(true);
-    setTimeout(() => { try { setTicks(D.makeDemoTicks(v)); } finally { busy(false); } }, 20);
+    setTimeout(() => { try { sources = []; setTicks(D.makeDemoTicks(v)); } finally { busy(false); } }, 20);
   });
   window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragover'); });
   window.addEventListener('dragleave', e => { if (e.target === document.documentElement || !e.relatedTarget) document.body.classList.remove('dragover'); });
-  window.addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('dragover'); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+  window.addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('dragover'); const fl = e.dataTransfer.files; if (!fl.length) return;
+    // Dropping onto an already-loaded chart adds the files (same symbol); otherwise it opens them.
+    loadFiles(fl, !!(ticks && sources.length)); });
 
   // ====================================================================
   // Tick size

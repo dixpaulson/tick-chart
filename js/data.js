@@ -319,8 +319,30 @@
     return s / (period * (period + 1) / 2);
   }
 
+  // ---------- Merge several tick files (e.g. one per day) ----------
+  // Files may be given in any order and may overlap; overlapping ticks are dropped.
+  function mergeTicks(list) {
+    list = list.filter(x => x && x.n > 0).sort((a, b) => a.t[0] - b.t[0]);
+    if (list.length === 1) return list[0];
+    let total = 0; for (const x of list) total += x.n;
+    const T = new Float64Array(total), B = new Float64Array(total), A = new Float64Array(total), F = new Uint8Array(total);
+    let n = 0, lastT = -Infinity, digits = 0;
+    for (const x of list) {
+      digits = Math.max(digits, x.digits);
+      for (let i = 0; i < x.n; i++) {
+        if (x.t[i] <= lastT && n > 0 && i === 0) { // overlap: skip until past what we already have
+          while (i < x.n && x.t[i] <= lastT) i++;
+          if (i >= x.n) break;
+        }
+        T[n] = x.t[i]; B[n] = x.bid[i]; A[n] = x.ask[i]; F[n] = x.flags[i]; n++;
+        lastT = x.t[i];
+      }
+    }
+    return { n, t: T.subarray(0, n), bid: B.subarray(0, n), ask: A.subarray(0, n), flags: F.subarray(0, n), digits, symbol: list[0].symbol, meta: list[0].meta };
+  }
+
   global.TickData = {
-    DAY_MS, decodeBuffer, parseTicks, makeDemoTicks, buildCandles, candleOfTick, tickAtOrAfter,
+    DAY_MS, decodeBuffer, parseTicks, mergeTicks, makeDemoTicks, buildCandles, candleOfTick, tickAtOrAfter,
     buildDays, buildCPR, cprFromHLC, computeMA, maLive
   };
 })(window);
