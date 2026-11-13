@@ -1,0 +1,6 @@
+# Bridge: private settings (contains your access key), logs, saved lines, Python env
+bridge/config.json
+bridge/data/
+bridge/.venv/
+__pycache__/
+*.pyc

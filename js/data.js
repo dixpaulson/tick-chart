@@ -200,37 +200,70 @@
     return { n, t: Float64Array.from(out.t), bid: Float64Array.from(out.bid), ask: Float64Array.from(out.ask), flags, digits, symbol: (gold ? 'XAUUSD' : 'GER40') + ' (demo)', meta: {} };
   }
 
-  // ---------- Tick candles ----------
+  // ---------- Growable tick store (for live data) ----------
+  function growArr(a, need) {
+    if (need <= a.length) return a;
+    const b = new a.constructor(Math.max(need, a.length * 2, 1024));
+    b.set(a);
+    return b;
+  }
+  // Append ticks: rows = [[time_msc, bid, ask, flags], ...] (must be newer than the last tick).
+  function appendTicks(tk, rows) {
+    const need = tk.n + rows.length;
+    tk.t = growArr(tk.t, need); tk.bid = growArr(tk.bid, need); tk.ask = growArr(tk.ask, need); tk.flags = growArr(tk.flags, need);
+    let added = 0;
+    for (const r of rows) {
+      const t = +r[0];
+      if (tk.n > 0 && t < tk.t[tk.n - 1]) continue;
+      tk.t[tk.n] = t; tk.bid[tk.n] = +r[1]; tk.ask[tk.n] = +r[2]; tk.flags[tk.n] = (+r[3] || 6) & 255; tk.n++; added++;
+    }
+    return added;
+  }
+  function emptyTicks(symbol, digits) {
+    return { n: 0, t: new Float64Array(1024), bid: new Float64Array(1024), ask: new Float64Array(1024), flags: new Uint8Array(1024), digits, symbol, meta: {} };
+  }
+
+  // ---------- Tick candles (incremental) ----------
   // countMode: 'all' = every tick record counts; 'bid' = only ticks where bid changed.
   // syncDay: start a fresh candle at the first tick of each new (server) day.
-  function buildCandles(ticks, size, countMode, syncDay) {
+  function createCandles(size, countMode, syncDay, cap) {
+    cap = Math.max(256, cap || 0);
+    return {
+      n: 0, size, countMode, syncDay, nextTick: 0, count: 0, curDay: -1, prevBid: NaN,
+      start: new Int32Array(cap), end: new Int32Array(cap), day: new Int32Array(cap),
+      o: new Float64Array(cap), h: new Float64Array(cap), l: new Float64Array(cap), c: new Float64Array(cap), t: new Float64Array(cap)
+    };
+  }
+  // Process ticks C.nextTick .. ticks.n-1. Returns index of the first candle that changed.
+  function extendCandles(C, ticks) {
     const n = ticks.n, T = ticks.t, B = ticks.bid, F = ticks.flags;
-    const cap = Math.ceil(n / Math.max(1, size)) + 64 * 8;
-    let start = new Int32Array(cap), end = new Int32Array(cap);
-    let o = new Float64Array(cap), h = new Float64Array(cap), l = new Float64Array(cap), c = new Float64Array(cap);
-    let m = 0, count = 0, curDay = -1;
-    const bidOnly = countMode === 'bid';
-    let prevBid = NaN;
-    for (let i = 0; i < n; i++) {
+    const bidOnly = C.countMode === 'bid', size = C.size;
+    const firstChanged = Math.max(0, C.n - 1);
+    for (let i = C.nextTick; i < n; i++) {
       const day = Math.floor(T[i] / DAY_MS);
-      const counts = !bidOnly || (F[i] & FLAG_BID) || B[i] !== prevBid;
-      prevBid = B[i];
-      const newDay = syncDay && day !== curDay;
-      if (m === 0 || newDay || (count >= size && counts)) {
-        if (m >= start.length) { // grow (rare)
-          const g = (a, C) => { const x = new C(a.length * 2); x.set(a); return x; };
-          start = g(start, Int32Array); end = g(end, Int32Array); o = g(o, Float64Array); h = g(h, Float64Array); l = g(l, Float64Array); c = g(c, Float64Array);
+      const counts = !bidOnly || (F[i] & FLAG_BID) || B[i] !== C.prevBid;
+      C.prevBid = B[i];
+      if (C.n === 0 || (C.syncDay && day !== C.curDay) || (C.count >= size && counts)) {
+        const m = C.n;
+        if (m >= C.start.length) {
+          const need = m + 1;
+          C.start = growArr(C.start, need); C.end = growArr(C.end, need); C.day = growArr(C.day, need);
+          C.o = growArr(C.o, need); C.h = growArr(C.h, need); C.l = growArr(C.l, need); C.c = growArr(C.c, need); C.t = growArr(C.t, need);
         }
-        start[m] = i; o[m] = h[m] = l[m] = c[m] = B[i]; end[m] = i; m++; count = 0; curDay = day;
+        C.start[m] = i; C.end[m] = i; C.o[m] = C.h[m] = C.l[m] = C.c[m] = B[i]; C.t[m] = T[i]; C.day[m] = day;
+        C.n++; C.count = 0; C.curDay = day;
       }
-      const k = m - 1;
-      const p = B[i];
-      if (p > h[k]) h[k] = p; if (p < l[k]) l[k] = p; c[k] = p; end[k] = i;
-      if (counts) count++;
+      const k = C.n - 1, p = B[i];
+      if (p > C.h[k]) C.h[k] = p; if (p < C.l[k]) C.l[k] = p; C.c[k] = p; C.end[k] = i;
+      if (counts) C.count++;
     }
-    const tt = new Float64Array(m);
-    for (let k = 0; k < m; k++) tt[k] = T[start[k]];
-    return { n: m, size, start: start.subarray(0, m), end: end.subarray(0, m), o: o.subarray(0, m), h: h.subarray(0, m), l: l.subarray(0, m), c: c.subarray(0, m), t: tt };
+    C.nextTick = n;
+    return firstChanged;
+  }
+  function buildCandles(ticks, size, countMode, syncDay) {
+    const C = createCandles(size, countMode, syncDay, Math.ceil(ticks.n / Math.max(1, size)) + 64);
+    extendCandles(C, ticks);
+    return C;
   }
 
   // Binary search: index of candle containing tick i
@@ -247,17 +280,18 @@
   }
 
   // ---------- Daily OHLC + CPR ----------
-  function buildDays(ticks) {
-    const days = [];
+  // Daily OHLC (server days). updateDays continues from tick `from` (pass days.from to resume).
+  function updateDays(days, ticks, from) {
     const T = ticks.t, B = ticks.bid;
-    let cur = null;
-    for (let i = 0; i < ticks.n; i++) {
+    let cur = days.length ? days[days.length - 1] : null;
+    for (let i = from || 0; i < ticks.n; i++) {
       const d = Math.floor(T[i] / DAY_MS);
       if (!cur || cur.day !== d) { cur = { day: d, start: i, end: i, o: B[i], h: B[i], l: B[i], c: B[i] }; days.push(cur); }
       const p = B[i]; if (p > cur.h) cur.h = p; if (p < cur.l) cur.l = p; cur.c = p; cur.end = i;
     }
     return days;
   }
+  function buildDays(ticks) { return updateDays([], ticks, 0); }
 
   function cprFromHLC(H, L, C) {
     const P = (H + L + C) / 3;
@@ -342,7 +376,7 @@
   }
 
   global.TickData = {
-    DAY_MS, decodeBuffer, parseTicks, mergeTicks, makeDemoTicks, buildCandles, candleOfTick, tickAtOrAfter,
+    DAY_MS, decodeBuffer, parseTicks, mergeTicks, appendTicks, emptyTicks, createCandles, extendCandles, updateDays, makeDemoTicks, buildCandles, candleOfTick, tickAtOrAfter,
     buildDays, buildCPR, cprFromHLC, computeMA, maLive
   };
 })(window);

@@ -9,7 +9,16 @@ An MT5-style **historical tick chart** viewer with **replay** and **paper tradin
 - Replay one tick at a time, one candle at a time, or at a multiple of real time. You can also jump to any date/time
 - Paper trading with bid/ask spread: market orders, plus limit/stop orders you place by clicking on the chart. S/L and T/P lines can be dragged, and you can export your trade log to CSV
 
-## Quick start
+## Live data and trading (MT5 bridge)
+
+Run the small Python **bridge** on the PC or VPS where MT5 runs, and the same page becomes a live tick chart:
+- history for any date loaded straight from MT5
+- trading your demo account: market orders, limit/stop orders by tapping the chart, and draggable S/L and T/P
+- phone access through Tailscale
+
+Setup steps: **[bridge/SETUP.md](bridge/SETUP.md)**.
+
+## Quick start (files, no bridge)
 
 1. Download/clone this repo.
 2. Double-click **`index.html`** (Chrome or Edge recommended). No install or server is needed.
@@ -50,6 +59,8 @@ The app reads this tab-separated format directly (UTF-16 or UTF-8).
 | Change ticks per candle | Box in the toolbar (presets 10…1000) |
 | Indicators, colours, trading settings | **⚙ Settings** |
 | Jump to a time | Date box → **Go** |
+| Support / resistance lines | **─ Line** (key **H**), then click the chart. Drag to move; click a line to recolour or delete it (or press Del) |
+| Time zone | Times are shown in Kitchener time by default. The broker's server is assumed to run at New York + 7h, as most brokers' do. Change this in ⚙ Settings → Time |
 
 ### Replay
 
@@ -67,7 +78,7 @@ The app reads this tab-separated format directly (UTF-16 or UTF-8).
 - **Drag a position's entry line** up or down to create a T/P or S/L (like MT5).
 - **+SL / +TP / ✕** buttons in the Trade tab. Default S/L and T/P distances can be set in Settings.
 - Fills: buy orders fill at ask, sell orders at bid. Limit orders and T/P fill at your price; stop orders and S/L fill at the market price, so a gap causes slippage.
-- **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, with defaults of GER40 = 1 EUR and XAUUSD = 100 USD. Check your broker's contract specification.
+- **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, with defaults of GER40 = 10 EUR (contract size 10) and XAUUSD = 100 USD. With the bridge, the value comes from MT5. Check your broker's contract specification.
 - The History tab has **Export CSV** and **Reset account**.
 
 ## How ticks are counted
@@ -79,8 +90,10 @@ The app reads this tab-separated format directly (UTF-16 or UTF-8).
 ```
 index.html            page
 css/style.css         styles
-js/data.js            parsing, tick candles, CPR, moving averages
-js/app.js             chart, replay, paper trading, UI
+js/data.js            parsing, tick candles (incremental), CPR, moving averages
+js/time.js            server time -> local time
+js/app.js             chart, replay, paper + live trading, lines, UI
+bridge/               Python bridge to MT5 (tickbridge.py, start_bridge.bat, SETUP.md)
 js/lib/               TradingView Lightweight Charts v4.2.0 (Apache-2.0)
 mql5/ExportTicks.mq5  MT5 export script
 ```

@@ -1,9 +1,11 @@
-/* Tick Chart — application: chart, replay, paper trading, UI. */
+/* Tick Chart — application: chart, replay, paper trading, live trading (via the bridge), UI. */
 (function () {
   'use strict';
   const LWC = LightweightCharts;
   const D = TickData;
+  const TT = TickTime;
   const $ = id => document.getElementById(id);
+  const DAY = D.DAY_MS;
 
   // ====================================================================
   // Settings
@@ -14,15 +16,18 @@
     ma2: { on: true, type: 'EMA', period: 21, color: '#ff2a2a', width: 2 },
     cpr: { on: true, showRS: true, colP: '#facc15', colCPR: '#22c55e', colR: '#ef5350', colS: '#42a5f5', narrowPct: 0.15, widePct: 0.35 },
     firstHLC: { h: 0, l: 0, c: 0 },
-    trade: { lots: 1, balance: 10000, slPts: 0, tpPts: 0 },
+    trade: { lots: 1, balance: 10000, slPts: 0, tpPts: 0, confirm: true },
+    tz: { display: 'America/Toronto', server: 'ny7' },
     vppBySymbol: {}, curBySymbol: {},
-    speedMode: 'tick', speeds: { tick: 50, candle: 2, time: 10 }
+    speedMode: 'tick', speeds: { tick: 50, candle: 2, time: 10 },
+    liveSymbol: '', infoOpen: true, panelOpen: true
   };
   const SPEEDS = {
     tick: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
     candle: [0.25, 0.5, 1, 2, 3, 5, 10, 20, 50],
     time: [1, 2, 5, 10, 30, 60, 120, 300]
   };
+  const LINE_COLORS = ['#ffffff', '#facc15', '#38bdf8', '#f472b6', '#a3e635', '#fb923c'];
   function merge(base, over) {
     const out = Array.isArray(base) ? base.slice() : { ...base };
     if (over && typeof over === 'object') for (const k of Object.keys(over)) {
@@ -30,27 +35,39 @@
     }
     return out;
   }
-  let S = DEFAULTS;
+  let S;
   try { S = merge(DEFAULTS, JSON.parse(localStorage.getItem('tickchart.settings') || '{}')); } catch (e) { S = merge(DEFAULTS, {}); }
+  const narrowScreen = () => window.matchMedia('(max-width: 760px)').matches;
+  if (narrowScreen() && !localStorage.getItem('tickchart.settings')) { S.infoOpen = false; S.panelOpen = false; }
   function saveSettings() { try { localStorage.setItem('tickchart.settings', JSON.stringify(S)); } catch (e) { /* ignore */ } }
 
   // ====================================================================
   // State
   // ====================================================================
   let ticks = null, days = [], dayIndex = new Map(), cprMap = new Map();
-  let C = null;            // candles
-  let cDay = null;         // day number per candle
+  let C = null;
   let ma1 = null, ma2 = null;
+  let runtimeHLC = null;   // previous-day H/L/C for the first loaded day (from the bridge)
   const R = { active: false, picking: false, cursor: -1, playing: false, shownCi: -1, raf: 0, acc: 0, simT: 0, lastTs: 0 };
   const TR = { balance: S.trade.balance, positions: [], orders: [], history: [], nextId: 1, placing: null };
+  const LIVE = {
+    bridge: null, on: false, ws: null, symbol: '', symInfo: null, account: null, trading: { enabled: false, reason: '' },
+    positions: [], orders: [], connected: false, retry: 0, reconnectT: 0, ignoreSnapUntil: 0, inflight: 0
+  };
+  const HL = { list: [], selected: null, symbol: '' };
 
   const symbolKey = () => (ticks ? ticks.symbol.replace(/\s*\(demo\)/, '').toUpperCase() : '');
+  const symInfo = () => (LIVE.symInfo && ticks && LIVE.symInfo.name.toUpperCase() === symbolKey()) ? LIVE.symInfo : null;
   function vpp() {
+    const si = symInfo(); if (si && si.value_per_point) return si.value_per_point;
     const k = symbolKey();
-    if (S.vppBySymbol[k] !== undefined) return +S.vppBySymbol[k];
-    return /XAU/.test(k) ? 100 : 1;
+    if (S.vppBySymbol[k] !== undefined && S.vppBySymbol[k] !== '') return +S.vppBySymbol[k];
+    if (/XAU/.test(k)) return 100;
+    if (/GER|DE40|DAX/.test(k)) return 10;
+    return 1;
   }
   function currency() {
+    if (symInfo() && LIVE.account) return LIVE.account.currency;
     const k = symbolKey();
     if (S.curBySymbol[k]) return S.curBySymbol[k];
     return /XAU|USD$|US30|NAS|SPX/.test(k) ? 'USD' : 'EUR';
@@ -58,21 +75,32 @@
   const digits = () => (ticks ? ticks.digits : 2);
   const fmtP = p => (p == null || !isFinite(p)) ? '—' : p.toFixed(digits());
   const roundP = p => { const f = Math.pow(10, digits()); return Math.round(p * f) / f; };
+  const minStopDist = () => { const si = symInfo(); return (tradeMode() === 'live' && si) ? si.stops_level * si.point : 0; };
+
+  const tradeMode = () => R.active ? 'paper' : (LIVE.on ? 'live' : null);
+  const curIdx = () => R.active ? R.cursor : (ticks ? ticks.n - 1 : -1);
+  const tail = () => R.active || LIVE.on;
+  const posList = () => tradeMode() === 'live' ? LIVE.positions : TR.positions;
+  const ordList = () => tradeMode() === 'live' ? LIVE.orders : TR.orders;
 
   // ====================================================================
-  // Time formatting (server time stored as UTC ms)
+  // Time formatting — ticks are server time; shown in the chosen zone (default Kitchener)
   // ====================================================================
   const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const pad = (n, w = 2) => String(n).padStart(w, '0');
-  function fmtShort(ms) { const d = new Date(ms); return `${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`; }
-  function fmtFull(ms) { const d = new Date(ms); return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; }
-  function fmtIso(ms) { const d = new Date(ms); return `${d.getUTCFullYear()}.${pad(d.getUTCMonth() + 1)}.${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.${pad(d.getUTCMilliseconds(), 3)}`; }
-  function toInputValue(ms) { const d = new Date(ms); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; }
+  const disp = ms => TT.toDisplay(ms, S.tz);
+  function fmtShort(ms) { const d = new Date(disp(ms)); return `${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`; }
+  function fmtSec(ms) { const d = new Date(disp(ms)); return `${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; }
+  function fmtFull(ms) { const d = new Date(disp(ms)); return `${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]} ${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; }
+  function fmtIso(ms) { const d = new Date(disp(ms)); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.${pad(d.getUTCMilliseconds(), 3)}`; }
+  function toInputValue(ms) { const d = new Date(disp(ms)); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; }
   function fromInputValue(v) {
-    const m = v.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
-    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : NaN;
+    const m = (v || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+    return m ? TT.fromDisplay(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)), S.tz) : NaN;
   }
+  const dayName = day => { const x = new Date(day * DAY); return `${DOW[x.getUTCDay()]} ${x.getUTCDate()} ${MON[x.getUTCMonth()]}`; };
+  const isoDate = ms => { const d = new Date(ms); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; };
 
   // ====================================================================
   // Chart
@@ -130,8 +158,6 @@
   function rebuildCandles() {
     if (!ticks) return;
     C = D.buildCandles(ticks, Math.max(2, +S.tickSize | 0), S.countMode, S.syncDay);
-    cDay = new Int32Array(C.n);
-    for (let i = 0; i < C.n; i++) cDay[i] = Math.floor(C.t[i] / D.DAY_MS);
     rebuildMAs();
     $('titleSym').textContent = `${ticks.symbol}.Tick.${C.size}`;
   }
@@ -140,11 +166,12 @@
     ma1 = D.computeMA(S.ma1.type, Math.max(1, +S.ma1.period | 0), C.c, C.n);
     ma2 = D.computeMA(S.ma2.type, Math.max(1, +S.ma2.period | 0), C.c, C.n);
   }
-  function rebuildCPR() {
-    days = D.buildDays(ticks);
+  const firstHLC = () => runtimeHLC || S.firstHLC;
+  function rebuildCPRMap() {
     dayIndex = new Map(days.map((d, i) => [d.day, i]));
-    cprMap = D.buildCPR(days, S.firstHLC);
+    cprMap = D.buildCPR(days, firstHLC());
   }
+  function rebuildCPR() { days = D.buildDays(ticks); rebuildCPRMap(); }
 
   function fullBar(i) { return { time: i, open: C.o[i], high: C.h[i], low: C.l[i], close: C.c[i] }; }
   function formingBar(i, cursor) {
@@ -159,14 +186,13 @@
     return isFinite(v) ? { time: i, value: v } : { time: i };
   }
   function cprPoint(key, i) {
-    const lv = cprMap.get(cDay[i]);
+    const lv = cprMap.get(C.day[i]);
     if (!lv) return { time: i };
     // The segment i -> i+1 takes the colour of point i: hide the join between days.
-    if (i + 1 < C.n && cDay[i + 1] !== cDay[i]) return { time: i, value: lv[key], color: 'transparent' };
+    if (i + 1 < C.n && C.day[i + 1] !== C.day[i]) return { time: i, value: lv[key], color: 'transparent' };
     return { time: i, value: lv[key] };
   }
 
-  // Show candles up to candle ci (whose bar is `bar`).
   function setAll(ci, bar, final) {
     const bars = new Array(ci + 1), m1 = new Array(ci + 1), m2 = new Array(ci + 1);
     const cp = {}; CPR_KEYS.forEach(k => cp[k] = new Array(ci + 1));
@@ -186,17 +212,17 @@
     for (const k of CPR_KEYS) cprSeries[k].update(cprPoint(k, i));
   }
 
-  // Render everything visible up to tick `cursor` (replay), or the whole history.
+  // Render up to the current tick: replay cursor, newest live tick, or the whole history.
   function render(force) {
-    if (!C) return;
-    if (!R.active) {
-      if (force || R.shownCi !== C.n - 1) { setAll(C.n - 1, fullBar(C.n - 1), true); }
+    if (!C || !ticks || !ticks.n) return;
+    if (!tail()) {
+      if (force || R.shownCi !== C.n - 1) setAll(C.n - 1, fullBar(C.n - 1), true);
       R.shownCi = C.n - 1;
     } else {
-      const cur = R.cursor;
+      const cur = curIdx();
       const ci = D.candleOfTick(C, cur);
-      const final = cur >= C.end[ci];
-      const bar = final ? fullBar(ci) : formingBar(ci, cur);
+      const final = !LIVE.on && cur >= C.end[ci];
+      const bar = cur >= C.end[ci] ? fullBar(ci) : formingBar(ci, cur);
       if (force || R.shownCi < 0 || ci < R.shownCi || ci - R.shownCi > 400) setAll(ci, bar, final);
       else { for (let k = R.shownCi; k < ci; k++) updateOne(k, fullBar(k), true); updateOne(ci, bar, final); }
       R.shownCi = ci;
@@ -211,9 +237,7 @@
   // ====================================================================
   let uiPending = false;
   function scheduleUI() { if (!uiPending) { uiPending = true; requestAnimationFrame(() => { uiPending = false; drawUI(); }); } }
-  function drawUI() { drawInfo(); drawDaySeps(); drawOneClick(); drawTables(); drawStatus(); }
-
-  function currentTick() { return R.active ? R.cursor : (ticks ? ticks.n - 1 : -1); }
+  function drawUI() { drawInfo(); drawDaySeps(); drawOneClick(); drawTables(); drawStatus(); drawLiveStatus(); drawLineMenu(); }
 
   function cprRelation(cur, prev) {
     if (!prev) return null;
@@ -226,9 +250,11 @@
   }
   function drawInfo() {
     const el = $('infoPanel');
-    if (!C || !S.cpr.on) { el.innerHTML = ''; return; }
-    const t = currentTick();
-    const day = Math.floor(ticks.t[t] / D.DAY_MS);
+    $('btnInfo').classList.toggle('active', !!S.infoOpen);
+    if (!C || !S.cpr.on || !S.infoOpen) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    const t = curIdx();
+    const day = Math.floor(ticks.t[t] / DAY);
     const lv = cprMap.get(day);
     const di = dayIndex.get(day);
     const prevLv = di > 0 ? cprMap.get(days[di - 1].day) : null;
@@ -237,7 +263,7 @@
     L.push(`<span class="w">CPR + Pivots  [Daily / Floor]</span>`);
     if (!lv) {
       L.push(`<span class="m">No CPR for this day (no previous day loaded).</span>`);
-      L.push(`<span class="m">Export one extra day or enter H/L/C in Settings.</span>`);
+      L.push(`<span class="m">Load one extra day or enter H/L/C in Settings.</span>`);
     } else {
       L.push(`<span class="w">P ${fmtP(lv.P)}   TC ${fmtP(lv.TC)}   BC ${fmtP(lv.BC)}</span>`);
       const w = lv.TC - lv.BC, wp = w / lv.P * 100;
@@ -252,7 +278,7 @@
         L.push(`<span class="g">S1 ${fmtP(lv.S1)}  S2 ${fmtP(lv.S2)}  S3 ${fmtP(lv.S3)}</span>`);
       }
     }
-    L.push(`<span class="m">${fmtFull(ticks.t[t])}  (server)</span>`);
+    L.push(`<span class="m">${fmtFull(ticks.t[t])}  ${TT.zoneLabel(S.tz)}</span>`);
     el.innerHTML = L.join('\n');
   }
 
@@ -263,10 +289,9 @@
     const range = ts.getVisibleLogicalRange();
     if (!range) { el.innerHTML = ''; return; }
     const from = Math.max(1, Math.floor(range.from)), to = Math.min(R.shownCi, Math.ceil(range.to));
-    let html = '';
-    let count = 0;
+    let html = '', count = 0;
     for (let i = from; i <= to && count < 60; i++) {
-      if (cDay[i] !== cDay[i - 1]) {
+      if (C.day[i] !== C.day[i - 1]) {
         const x1 = ts.timeToCoordinate(i), x0 = ts.timeToCoordinate(i - 1);
         const x = x1 === null ? null : (x0 === null ? x1 : (x0 + x1) / 2);
         if (x !== null) { html += `<div style="left:${Math.round(x)}px"></div>`; count++; }
@@ -277,46 +302,74 @@
 
   function drawOneClick() {
     const box = $('oneClick');
-    if (!ticks || !R.active) { box.classList.add('hidden'); return; }
+    const mode = tradeMode();
+    if (!ticks || !mode) { box.classList.add('hidden'); return; }
     box.classList.remove('hidden');
-    $('ocBid').textContent = fmtP(ticks.bid[R.cursor]);
-    $('ocAsk').textContent = fmtP(ticks.ask[R.cursor]);
+    box.classList.toggle('live', mode === 'live');
+    const i = curIdx();
+    $('ocBid').textContent = fmtP(ticks.bid[i]);
+    $('ocAsk').textContent = fmtP(ticks.ask[i]);
+    const badge = $('ocMode');
+    if (mode === 'live') {
+      const demo = LIVE.account && LIVE.account.demo;
+      badge.textContent = LIVE.trading.enabled ? (demo ? 'DEMO account' : 'LIVE account') : 'Trading off';
+      badge.className = 'oc-badge ' + (LIVE.trading.enabled ? (demo ? 'demo' : 'real') : 'off');
+      badge.title = LIVE.trading.enabled ? '' : LIVE.trading.reason;
+    } else { badge.textContent = 'Paper (replay)'; badge.className = 'oc-badge paper'; badge.title = ''; }
+    $('ocConfirmWrap').classList.toggle('hidden', mode !== 'live');
+    $('ocConfirm').checked = !S.trade.confirm;
   }
 
   function drawStatus() {
     const el = $('status');
     if (!ticks) { el.textContent = ''; return; }
     const parts = [`${ticks.n.toLocaleString()} ticks`, `${C.n.toLocaleString()} candles`, `${fmtShort(ticks.t[0])} → ${fmtShort(ticks.t[ticks.n - 1])}`];
-    if (R.active) parts.push(`replay ${(R.cursor / (ticks.n - 1) * 100).toFixed(1)}%`);
+    if (R.active) parts.push(`replay ${(R.cursor / Math.max(1, ticks.n - 1) * 100).toFixed(1)}%`);
     el.textContent = parts.join('  ·  ');
   }
 
-  chart.timeScale().subscribeVisibleLogicalRangeChange(() => drawDaySeps());
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => { drawDaySeps(); });
   new ResizeObserver(() => scheduleUI()).observe(chartEl);
 
-  // Crosshair legend (O H L C / ticks / duration)
   chart.subscribeCrosshairMove(param => {
     const el = $('legend');
     if (!C || param.time === undefined || param.time > R.shownCi) { el.textContent = ''; return; }
     const i = param.time;
     const b = param.seriesData.get(candleSeries);
     if (!b) { el.textContent = ''; return; }
-    const endTick = R.active && i === R.shownCi ? Math.min(R.cursor, C.end[i]) : C.end[i];
+    const endTick = tail() && i === R.shownCi ? Math.min(curIdx(), C.end[i]) : C.end[i];
     const dur = (ticks.t[endTick] - C.t[i]) / 1000;
     const durS = dur >= 60 ? `${Math.floor(dur / 60)}m${pad(Math.round(dur % 60))}s` : `${dur.toFixed(1)}s`;
     el.textContent = `O ${fmtP(b.open)}  H ${fmtP(b.high)}  L ${fmtP(b.low)}  C ${fmtP(b.close)}   ${endTick - C.start[i] + 1} ticks · ${durS}`;
   });
 
   // ====================================================================
-  // Loading data
+  // Messages
   // ====================================================================
-  function busy(on) { $('busy').classList.toggle('hidden', !on); }
-  function toast(msg, ms = 2600) {
+  function busy(on, text) { $('busy').textContent = text || 'Loading…'; $('busy').classList.toggle('hidden', !on); }
+  function toast(msg, ms = 2800) {
     const el = $('toast'); el.textContent = msg; el.classList.add('show');
     clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('show'), ms);
   }
+  function hint(msg) { const h = $('hint'); if (msg) { h.innerHTML = msg; h.classList.remove('hidden'); } else h.classList.add('hidden'); }
 
-  function setTicks(tk) {
+  // In-page confirmation (browser confirm() is unreliable in embedded viewers)
+  const confirmDlg = $('confirmDlg');
+  function confirmBox(title, detail, danger) {
+    return new Promise(resolve => {
+      $('confirmTitle').textContent = title;
+      $('confirmText').textContent = detail || '';
+      $('confirmOk').className = 'btn ' + (danger ? 'danger' : 'primary');
+      confirmDlg.returnValue = '';
+      confirmDlg.onclose = () => resolve(confirmDlg.returnValue === 'ok');
+      confirmDlg.showModal();
+    });
+  }
+
+  // ====================================================================
+  // Loading data
+  // ====================================================================
+  function setTicks(tk, opts = {}) {
     stopReplay(true);
     ticks = tk;
     resetAccount(true);
@@ -329,17 +382,18 @@
     const jv = fromInputValue(jd.value);
     if (!(jv >= ticks.t[0] && jv <= ticks.t[ticks.n - 1])) jd.value = toInputValue(ticks.t[0]);
     $('addBtn').classList.toggle('hidden', !sources.length);
+    R.shownCi = -1;
+    loadLines();
     render(true);
     chart.timeScale().scrollToRealTime();
-    const noCpr = days.length && !cprMap.get(days[0].day);
-    const dayList = days.map(d => { const x = new Date(d.day * D.DAY_MS); return `${DOW[x.getUTCDay()]} ${x.getUTCDate()} ${MON[x.getUTCMonth()]}`; }).join(', ');
-    toast(`Loaded ${ticks.n.toLocaleString()} ticks of ${ticks.symbol}: ${dayList}` + (noCpr ? ' — first day has no CPR (no previous day)' : ''), 5000);
+    if (!opts.quiet) {
+      const noCpr = days.length && !cprMap.get(days[0].day);
+      toast(`Loaded ${ticks.n.toLocaleString()} ticks of ${ticks.symbol}: ${days.map(d => dayName(d.day)).join(', ')}` + (noCpr ? ' — first day has no CPR (no previous day)' : ''), 5000);
+    }
   }
 
-  // Loaded source files (one parsed tick set each). "Add" merges new files with these.
   let sources = [];
   const baseSym = s => String(s || '').replace(/\s*\(demo\)/, '').toUpperCase();
-
   async function loadFiles(fileList, add) {
     const files = Array.from(fileList || []);
     if (!files.length) return;
@@ -354,10 +408,9 @@
       if (!parsed.length) return;
       const syms = new Set(parsed.map(p => baseSym(p.symbol)));
       if (add && ticks && sources.length) syms.add(baseSym(sources[0].symbol));
-      if (syms.size > 1) {
-        toast(`These files are for different symbols (${[...syms].join(', ')}). Load one symbol at a time.`, 6000);
-        return;
-      }
+      if (syms.size > 1) { toast(`These files are for different symbols (${[...syms].join(', ')}). Load one symbol at a time.`, 6000); return; }
+      stopLive();
+      runtimeHLC = null;
       sources = (add && sources.length) ? sources.concat(parsed) : parsed;
       setTicks(D.mergeTicks(sources));
     } finally { busy(false); }
@@ -368,13 +421,15 @@
     const v = e.target.value; e.target.value = '';
     if (!v) return;
     busy(true);
-    setTimeout(() => { try { sources = []; setTicks(D.makeDemoTicks(v)); } finally { busy(false); } }, 20);
+    setTimeout(() => { try { stopLive(); runtimeHLC = null; sources = []; setTicks(D.makeDemoTicks(v)); } finally { busy(false); } }, 20);
   });
   window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragover'); });
   window.addEventListener('dragleave', e => { if (e.target === document.documentElement || !e.relatedTarget) document.body.classList.remove('dragover'); });
-  window.addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('dragover'); const fl = e.dataTransfer.files; if (!fl.length) return;
-    // Dropping onto an already-loaded chart adds the files (same symbol); otherwise it opens them.
-    loadFiles(fl, !!(ticks && sources.length)); });
+  window.addEventListener('drop', e => {
+    e.preventDefault(); document.body.classList.remove('dragover');
+    const fl = e.dataTransfer.files; if (!fl.length) return;
+    loadFiles(fl, !!(ticks && sources.length));
+  });
 
   // ====================================================================
   // Tick size
@@ -391,14 +446,13 @@
     rebuildCandles();
     R.shownCi = -1;
     render(true);
-    if (!R.active && centerTime !== null) scrollToTime(centerTime, false);
+    if (!tail() && centerTime !== null) scrollToTime(centerTime, false);
   });
   function visibleCenterTime() {
     if (!C) return null;
     const r = chart.timeScale().getVisibleLogicalRange();
     if (!r) return null;
-    const i = Math.max(0, Math.min(C.n - 1, Math.round((r.from + r.to) / 2)));
-    return C.t[i];
+    return C.t[Math.max(0, Math.min(C.n - 1, Math.round((r.from + r.to) / 2)))];
   }
   function scrollToTime(ms, mark) {
     const i = D.candleOfTick(C, Math.min(ticks.n - 1, D.tickAtOrAfter(ticks, ms)));
@@ -412,7 +466,6 @@
   // Replay
   // ====================================================================
   const btnReplay = $('btnReplay'), btnPlay = $('btnPlay');
-  function hint(msg) { const h = $('hint'); if (msg) { h.innerHTML = msg; h.classList.remove('hidden'); } else h.classList.add('hidden'); }
   function setReplayButtons() {
     const on = R.active;
     btnReplay.classList.toggle('active', on || R.picking);
@@ -420,13 +473,13 @@
     btnPlay.disabled = !on; $('btnStepTick').disabled = !on; $('btnStepCandle').disabled = !on;
     btnPlay.textContent = R.playing ? '❚❚' : '▶';
   }
-
   btnReplay.addEventListener('click', () => {
     if (!ticks) return toast('Load tick data first');
     if (R.active) { stopReplay(false); return; }
     if (R.picking) { R.picking = false; chartEl.classList.remove('placing'); hint(null); setReplayButtons(); return; }
+    if (LIVE.on) { stopLive(); toast('Live view paused. Replaying the loaded data.'); render(true); }
     R.picking = true; chartEl.classList.add('placing');
-    hint('Click a candle to start the replay after it — or pick a date/time and press <b>Go</b>.  (Esc to cancel)');
+    hint('Tap a candle to start the replay after it, or pick a date/time and press <b>Go</b>. (Esc to cancel)');
     setReplayButtons();
   });
 
@@ -435,6 +488,7 @@
     if (R.active && cursor < R.cursor && (TR.positions.length || TR.orders.length)) {
       toast('Close open positions/orders before jumping backwards'); return;
     }
+    if (LIVE.on) stopLive();
     R.picking = false; chartEl.classList.remove('placing'); hint(null);
     if (R.active && cursor > R.cursor) { advanceTo(cursor); }
     else {
@@ -444,21 +498,19 @@
     }
     setReplayButtons();
   }
-
   function stopReplay(silent) {
     pause();
     if (R.active && ticks && TR.positions.length) {
       const i = R.cursor;
-      TR.positions.slice().forEach(p => closePosition(p, p.side === 'buy' ? ticks.bid[i] : ticks.ask[i], i, 'replay stop'));
+      TR.positions.slice().forEach(p => paperClose(p, p.side === 'buy' ? ticks.bid[i] : ticks.ask[i], i, 'replay stop'));
     }
     TR.orders = [];
     R.active = false; R.picking = false; R.shownCi = -1;
     cancelPlacing();
     chartEl.classList.remove('placing'); hint(null);
     setReplayButtons();
-    if (!silent && C) { render(true); }
+    if (!silent && C) render(true);
   }
-
   function advanceTo(target) {
     target = Math.min(ticks.n - 1, target);
     for (let i = R.cursor + 1; i <= target; i++) processTick(i);
@@ -471,7 +523,6 @@
     if (cur < C.end[ci]) return C.end[ci];
     return ci + 1 < C.n ? C.end[ci + 1] : cur;
   }
-
   function play() {
     if (!R.active || R.playing) return;
     if (R.cursor >= ticks.n - 1) return toast('End of data');
@@ -493,13 +544,12 @@
     } else {
       R.simT += dt * speed * 1000;
       const next = target + 1 < ticks.n ? ticks.t[target + 1] : Infinity;
-      if (next - R.simT > 5000 * speed) R.simT = next; // skip long gaps (e.g. overnight)
+      if (next - R.simT > 5000 * speed) R.simT = next;
       while (target + 1 < ticks.n && ticks.t[target + 1] <= R.simT) target++;
     }
     if (target > R.cursor) advanceTo(target);
     if (R.playing) R.raf = requestAnimationFrame(loop);
   }
-
   btnPlay.addEventListener('click', () => R.playing ? pause() : play());
   $('btnStepTick').addEventListener('click', () => { if (R.active) { pause(); advanceTo(R.cursor + 1); } });
   $('btnStepCandle').addEventListener('click', () => { if (R.active) { pause(); advanceTo(endOfNextCandle(R.cursor)); } });
@@ -525,78 +575,119 @@
   });
 
   // ====================================================================
-  // Paper trading
+  // Trading — shared by paper (replay) and live (MT5 via the bridge)
   // ====================================================================
   const lotsEl = $('lots');
   lotsEl.value = S.trade.lots;
   lotsEl.addEventListener('change', () => { S.trade.lots = Math.max(0.01, +lotsEl.value || 1); lotsEl.value = S.trade.lots; saveSettings(); });
   const lots = () => Math.max(0.01, +S.trade.lots || 1);
   const dir = side => side === 'buy' ? 1 : -1;
+  const money = v => (v >= 0 ? '+' : '') + (+v).toFixed(2);
 
   function resetAccount(silent) {
     TR.balance = +S.trade.balance || 10000; TR.positions = []; TR.orders = []; TR.history = []; TR.nextId = 1;
-    if (!silent) { render(false); toast('Account reset'); }
+    if (!silent) { render(false); toast('Paper account reset'); }
   }
   function defaultStops(side, entry) {
     const sl = +S.trade.slPts > 0 ? roundP(entry - dir(side) * S.trade.slPts) : null;
     const tp = +S.trade.tpPts > 0 ? roundP(entry + dir(side) * S.trade.tpPts) : null;
     return { sl, tp };
   }
-  function requireReplay() {
+  function requireTrading() {
     if (!ticks) { toast('Load tick data first'); return false; }
-    if (!R.active) { toast('Start a replay to paper trade (⏪ Replay)'); return false; }
+    const m = tradeMode();
+    if (!m) { toast(LIVE.bridge ? 'Switch on Live, or start a Replay to paper trade' : 'Start a replay to paper trade (⏪ Replay)'); return false; }
+    if (m === 'live' && !LIVE.trading.enabled) { toast(LIVE.trading.reason || 'Trading is not available', 6000); return false; }
+    if (m === 'live' && LIVE.bridge && lots() > LIVE.bridge.limits.max_lots + 1e-9) { toast(`Lot size is above your limit of ${LIVE.bridge.limits.max_lots}`); return false; }
     return true;
   }
-
-  function marketOrder(side) {
-    if (!requireReplay()) return;
-    const i = R.cursor;
-    const price = side === 'buy' ? ticks.ask[i] : ticks.bid[i];
-    const st = defaultStops(side, price);
-    openPosition(side, lots(), price, i, st.sl, st.tp);
-    render(false);
+  const bidNow = () => ticks.bid[curIdx()], askNow = () => ticks.ask[curIdx()];
+  function orderType(side, price) {
+    if (side === 'buy') return price < askNow() ? 'limit' : 'stop';
+    return price > bidNow() ? 'limit' : 'stop';
   }
-  function openPosition(side, l, price, tick, sl, tp) {
+
+  // ---- live requests
+  async function api(path, opts) {
+    const r = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...opts });
+    if (!r.ok) throw new Error((await r.text()).slice(0, 200) || r.statusText);
+    return r;
+  }
+  async function liveTrade(req, label, confirmText) {
+    if (confirmText && S.trade.confirm) {
+      const acct = LIVE.account ? `${LIVE.account.demo ? 'DEMO' : 'LIVE'} account ${LIVE.account.login}` : '';
+      const ok = await confirmBox(label, `${confirmText}\n${acct}`, LIVE.account && !LIVE.account.demo);
+      if (!ok) return false;
+    }
+    LIVE.inflight++;
+    try {
+      const res = await (await api('api/trade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: LIVE.symbol, ...req }) })).json();
+      if (!res.ok) { toast(`MT5: ${res.message}`, 6500); return false; }
+      toast(`${label}: done`);
+      return true;
+    } catch (e) { toast(`Bridge error: ${e.message}`, 6000); return false; }
+    finally { LIVE.inflight--; LIVE.ignoreSnapUntil = performance.now() + 800; }
+  }
+
+  // ---- actions (dispatch by mode)
+  async function marketOrder(side) {
+    if (!requireTrading()) return;
+    const price = side === 'buy' ? askNow() : bidNow();
+    const st = defaultStops(side, price);
+    if (tradeMode() === 'paper') { paperOpen(side, lots(), price, R.cursor, st.sl, st.tp); render(false); return; }
+    await liveTrade({ action: 'market', side, lots: lots(), sl: st.sl, tp: st.tp }, `${side.toUpperCase()} ${lots()} ${LIVE.symbol}`,
+      `Market ${side} ${lots()} lot(s) at about ${fmtP(price)}` + (st.sl ? `, S/L ${fmtP(st.sl)}` : '') + (st.tp ? `, T/P ${fmtP(st.tp)}` : ''));
+  }
+  async function placePending(side, price) {
+    if (!requireTrading()) return;
+    price = roundP(price);
+    const type = orderType(side, price);
+    const st = defaultStops(side, price);
+    if (type === 'stop') toast(`That price is on the other side of the market, so this is a ${side.toUpperCase()} STOP order`);
+    if (tradeMode() === 'paper') {
+      TR.orders.push({ id: TR.nextId++, side, type, price, lots: lots(), sl: st.sl, tp: st.tp, createdTick: R.cursor });
+      render(false); return;
+    }
+    await liveTrade({ action: 'pending', side, type, price, lots: lots(), sl: st.sl, tp: st.tp },
+      `${side.toUpperCase()} ${type.toUpperCase()} ${lots()} @ ${fmtP(price)}`, `Place a ${side} ${type} order for ${lots()} lot(s) at ${fmtP(price)}`);
+  }
+  async function closePos(p) {
+    if (tradeMode() === 'paper') { paperClose(p, p.side === 'buy' ? bidNow() : askNow(), R.cursor, 'manual'); render(false); return; }
+    await liveTrade({ action: 'close', ticket: p.id }, `Close #${p.id}`, `Close ${p.side} ${p.lots} lot(s), profit now ${money(p.profit)} ${currency()}`);
+  }
+  async function cancelOrder(o) {
+    if (tradeMode() === 'paper') { TR.orders = TR.orders.filter(x => x !== o); render(false); return; }
+    await liveTrade({ action: 'cancel', ticket: o.id }, `Cancel #${o.id}`);
+  }
+  // Set S/L & T/P of a position. Optimistic: shown at once, reverted if MT5 refuses.
+  async function setPosStops(p, sl, tp) {
+    const old = { sl: p.sl, tp: p.tp };
+    p.sl = sl; p.tp = tp; render(false);
+    if (tradeMode() !== 'live') return;
+    const ok = await liveTrade({ action: 'modify_position', ticket: p.id, sl, tp }, `#${p.id} S/L ${fmtP(sl)} T/P ${fmtP(tp)}`);
+    if (!ok) { Object.assign(p, old); render(false); }
+  }
+  async function modifyOrder(o, price, sl, tp) {
+    const old = { price: o.price, sl: o.sl, tp: o.tp };
+    Object.assign(o, { price, sl, tp }); render(false);
+    if (tradeMode() !== 'live') return;
+    const ok = await liveTrade({ action: 'modify_order', ticket: o.id, price, sl, tp }, `Order #${o.id} @ ${fmtP(price)}`);
+    if (!ok) { Object.assign(o, old); render(false); }
+  }
+
+  // ---- paper engine
+  function paperOpen(side, l, price, tick, sl, tp) {
     const p = { id: TR.nextId++, side, lots: l, entry: price, entryTick: tick, sl, tp };
     TR.positions.push(p);
     return p;
   }
-  function closePosition(p, price, tick, reason) {
+  function paperClose(p, price, tick, reason) {
     const points = (price - p.entry) * dir(p.side);
     const pnl = points * p.lots * vpp();
     TR.balance += pnl;
     TR.history.push({ ...p, exit: price, exitTick: tick, reason, points, pnl });
     TR.positions = TR.positions.filter(x => x !== p);
   }
-
-  function startPlacing(side) {
-    if (!requireReplay()) return;
-    TR.placing = side;
-    chartEl.classList.add('placing');
-    $(side === 'buy' ? 'btnBuyLimit' : 'btnSellLimit').classList.add('active');
-    $(side === 'buy' ? 'btnSellLimit' : 'btnBuyLimit').classList.remove('active');
-    hint(`Click on the chart at the price for your <b>${side.toUpperCase()}</b> order. (Esc to cancel)`);
-  }
-  function cancelPlacing() {
-    TR.placing = null;
-    if (!R.picking) { chartEl.classList.remove('placing'); hint(null); }
-    $('btnBuyLimit').classList.remove('active'); $('btnSellLimit').classList.remove('active');
-  }
-  function orderType(side, price) {
-    const i = R.cursor;
-    if (side === 'buy') return price < ticks.ask[i] ? 'limit' : 'stop';
-    return price > ticks.bid[i] ? 'limit' : 'stop';
-  }
-  function placePending(side, price) {
-    price = roundP(price);
-    const type = orderType(side, price);
-    const st = defaultStops(side, price);
-    TR.orders.push({ id: TR.nextId++, side, type, price, lots: lots(), sl: st.sl, tp: st.tp, createdTick: R.cursor });
-    if (type === 'stop') toast(`Price is on the other side of the market — placed as ${side.toUpperCase()} STOP`);
-    render(false);
-  }
-
-  // Called for every tick revealed during replay.
   function processTick(i) {
     const b = ticks.bid[i], a = ticks.ask[i];
     if (TR.orders.length) {
@@ -606,68 +697,142 @@
         else if (o.side === 'sell' && o.type === 'limit' && b >= o.price) fill = Math.max(b, o.price);
         else if (o.side === 'buy' && o.type === 'stop' && a >= o.price) fill = a;
         else if (o.side === 'sell' && o.type === 'stop' && b <= o.price) fill = b;
-        if (fill !== null) {
-          TR.orders = TR.orders.filter(x => x !== o);
-          openPosition(o.side, o.lots, fill, i, o.sl, o.tp);
-        }
+        if (fill !== null) { TR.orders = TR.orders.filter(x => x !== o); paperOpen(o.side, o.lots, fill, i, o.sl, o.tp); }
       }
     }
     if (TR.positions.length) {
       for (const p of TR.positions.slice()) {
         if (p.entryTick === i) continue;
         if (p.side === 'buy') {
-          if (p.sl != null && b <= p.sl) closePosition(p, b, i, 'sl');
-          else if (p.tp != null && b >= p.tp) closePosition(p, Math.max(b, p.tp), i, 'tp');
+          if (p.sl != null && b <= p.sl) paperClose(p, b, i, 'sl');
+          else if (p.tp != null && b >= p.tp) paperClose(p, Math.max(b, p.tp), i, 'tp');
         } else {
-          if (p.sl != null && a >= p.sl) closePosition(p, a, i, 'sl');
-          else if (p.tp != null && a <= p.tp) closePosition(p, Math.min(a, p.tp), i, 'tp');
+          if (p.sl != null && a >= p.sl) paperClose(p, a, i, 'sl');
+          else if (p.tp != null && a <= p.tp) paperClose(p, Math.min(a, p.tp), i, 'tp');
         }
       }
     }
   }
-
-  function livePnL(p) {
-    const i = R.cursor;
-    const cur = p.side === 'buy' ? ticks.bid[i] : ticks.ask[i];
+  function pnlOf(p) {
+    const cur = p.side === 'buy' ? bidNow() : askNow();
     const points = (cur - p.entry) * dir(p.side);
-    return { cur, points, pnl: points * p.lots * vpp() };
+    return { cur, points, pnl: p.live ? p.profit : points * p.lots * vpp() };
   }
-  const money = v => (v >= 0 ? '+' : '') + v.toFixed(2);
 
-  // ---------- price lines (orders / positions / ask) ----------
-  const lines = new Map(); // key -> IPriceLine
-  let dragTargets = [];    // { key, price, kind, obj, field }
-  let preview = null;      // { price, title, color } temporary line while dragging from an entry line
+  // ---- placing pending orders / horizontal lines by tapping the chart
+  function startPlacing(what) {
+    if (what !== 'hline' && !requireTrading()) return;
+    if (what === 'hline' && !ticks) return toast('Load tick data first');
+    TR.placing = what;
+    chartEl.classList.add('placing');
+    ['btnBuyLimit', 'btnSellLimit', 'btnHLine'].forEach(id => $(id).classList.remove('active'));
+    $(what === 'buy' ? 'btnBuyLimit' : what === 'sell' ? 'btnSellLimit' : 'btnHLine').classList.add('active');
+    hint(what === 'hline' ? 'Tap the chart where you want the line. (Esc to cancel)'
+      : `Tap the chart at the price for your <b>${what.toUpperCase()}</b> order. (Esc to cancel)`);
+  }
+  function cancelPlacing() {
+    TR.placing = null;
+    if (!R.picking) { chartEl.classList.remove('placing'); hint(null); }
+    ['btnBuyLimit', 'btnSellLimit', 'btnHLine'].forEach(id => $(id).classList.remove('active'));
+  }
 
-  function want(map, key, opts) { map.set(key, opts); }
+  // ====================================================================
+  // Horizontal lines (support / resistance) — saved per symbol, shared via the bridge
+  // ====================================================================
+  const linesKey = () => 'tickchart.hlines.' + symbolKey();
+  function loadLines() {
+    HL.selected = null; HL.symbol = symbolKey();
+    try { HL.list = JSON.parse(localStorage.getItem(linesKey()) || '[]'); } catch (e) { HL.list = []; }
+    if (LIVE.bridge && symInfo()) {
+      api('api/lines?symbol=' + encodeURIComponent(LIVE.symInfo.name)).then(r => r.json()).then(list => {
+        if (Array.isArray(list) && HL.symbol === symbolKey()) { HL.list = list; storeLocal(); syncLines(); scheduleUI(); }
+      }).catch(() => { /* keep local copy */ });
+    }
+  }
+  function storeLocal() { try { localStorage.setItem(linesKey(), JSON.stringify(HL.list)); } catch (e) { /* ignore */ } }
+  let linesSaveT = 0;
+  function saveLines() {
+    storeLocal();
+    if (LIVE.bridge && symInfo()) {
+      clearTimeout(linesSaveT);
+      linesSaveT = setTimeout(() => api('api/lines?symbol=' + encodeURIComponent(LIVE.symInfo.name), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(HL.list)
+      }).catch(e => toast('Could not save lines on the bridge: ' + e.message)), 400);
+    }
+  }
+  function addLine(price) {
+    const color = HL.list.length ? HL.list[HL.list.length - 1].color : LINE_COLORS[1];
+    const l = { id: 'h' + Date.now().toString(36), price: roundP(price), color };
+    HL.list.push(l); HL.selected = l.id;
+    saveLines(); syncLines(); scheduleUI();
+  }
+  function deleteSelectedLine() {
+    if (!HL.selected) return;
+    HL.list = HL.list.filter(l => l.id !== HL.selected); HL.selected = null;
+    saveLines(); syncLines(); scheduleUI();
+  }
+  function drawLineMenu() {
+    const m = $('lineMenu');
+    const l = HL.list.find(x => x.id === HL.selected);
+    if (!l || !ticks) { m.classList.add('hidden'); return; }
+    const y = candleSeries.priceToCoordinate(l.price);
+    if (y === null) { m.classList.add('hidden'); return; }
+    m.classList.remove('hidden');
+    m.style.top = Math.max(4, Math.round(y) - 34) + 'px';
+    m.style.right = (chart.priceScale('right').width() + 8) + 'px';
+    m.querySelectorAll('.sw').forEach(b => b.classList.toggle('on', b.dataset.c === l.color));
+  }
+  $('lineMenu').innerHTML = LINE_COLORS.map(c => `<button class="sw" data-c="${c}" style="background:${c}" title="Colour"></button>`).join('') +
+    '<button class="btn small" data-act="del" title="Delete line (Del)">🗑 Delete</button>';
+  $('lineMenu').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    const l = HL.list.find(x => x.id === HL.selected); if (!l) return;
+    if (b.dataset.act === 'del') deleteSelectedLine();
+    else if (b.dataset.c) { l.color = b.dataset.c; saveLines(); syncLines(); scheduleUI(); }
+  });
+  $('btnHLine').addEventListener('click', () => TR.placing === 'hline' ? cancelPlacing() : startPlacing('hline'));
+
+  // ====================================================================
+  // Price lines on the chart (positions, orders, ask, horizontal lines) + drag targets
+  // ====================================================================
+  const lines = new Map();
+  let dragTargets = [];
+  let preview = null;
   function syncLines() {
     const desired = new Map();
+    const want = (k, o) => desired.set(k, o);
     dragTargets = [];
-    if (ticks && R.active) {
-      const i = R.cursor;
-      if (S.askLine) want(desired, 'ask', { price: ticks.ask[i], color: '#ff5c5c', lineWidth: 1, lineStyle: LWC.LineStyle.Dotted, axisLabelVisible: true, title: '' });
-      const val = vpp();
-      for (const p of TR.positions) {
-        const lp = livePnL(p);
-        const col = p.side === 'buy' ? '#2fd16b' : '#ff5c5c';
-        want(desired, `p${p.id}`, { price: p.entry, color: col, lineWidth: 1, lineStyle: LWC.LineStyle.Solid, axisLabelVisible: true, title: `#${p.id} ${p.side.toUpperCase()} ${p.lots}  ${money(lp.pnl)}` });
-        dragTargets.push({ key: `p${p.id}`, price: p.entry, kind: 'posEntry', obj: p });
-        for (const f of ['sl', 'tp']) if (p[f] != null) {
-          const pts = (p[f] - p.entry) * dir(p.side);
-          want(desired, `p${p.id}${f}`, { price: p[f], color: f === 'sl' ? '#ff5252' : '#00c853', lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: `${f.toUpperCase()} #${p.id}  ${money(pts * p.lots * val)}` });
-          dragTargets.push({ key: `p${p.id}${f}`, price: p[f], kind: 'posStop', obj: p, field: f });
-        }
+    if (ticks && ticks.n) {
+      for (const l of HL.list) {
+        const sel = l.id === HL.selected;
+        want('hl' + l.id, { price: l.price, color: l.color, lineWidth: sel ? 2 : 1, lineStyle: LWC.LineStyle.Solid, axisLabelVisible: true, title: sel ? '◆' : '' });
+        dragTargets.push({ kind: 'hline', obj: l, price: l.price });
       }
-      for (const o of TR.orders) {
-        want(desired, `o${o.id}`, { price: o.price, color: '#5aa2ff', lineWidth: 1, lineStyle: LWC.LineStyle.LargeDashed, axisLabelVisible: true, title: `#${o.id} ${o.side.toUpperCase()} ${o.type.toUpperCase()} ${o.lots}` });
-        dragTargets.push({ key: `o${o.id}`, price: o.price, kind: 'order', obj: o });
-        for (const f of ['sl', 'tp']) if (o[f] != null) {
-          const pts = (o[f] - o.price) * dir(o.side);
-          want(desired, `o${o.id}${f}`, { price: o[f], color: f === 'sl' ? '#ff5252aa' : '#00c853aa', lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: `${f.toUpperCase()} #${o.id}  ${money(pts * o.lots * val)}` });
-          dragTargets.push({ key: `o${o.id}${f}`, price: o[f], kind: 'orderStop', obj: o, field: f });
+      const mode = tradeMode();
+      if (mode) {
+        if (S.askLine) want('ask', { price: askNow(), color: '#ff5c5c', lineWidth: 1, lineStyle: LWC.LineStyle.Dotted, axisLabelVisible: true, title: '' });
+        const val = vpp();
+        for (const p of posList()) {
+          const lp = pnlOf(p);
+          want(`p${p.id}`, { price: p.entry, color: p.side === 'buy' ? '#2fd16b' : '#ff5c5c', lineWidth: 1, lineStyle: LWC.LineStyle.Solid, axisLabelVisible: true, title: `#${p.id} ${p.side.toUpperCase()} ${p.lots}  ${money(lp.pnl)}` });
+          dragTargets.push({ kind: 'posEntry', obj: p, price: p.entry });
+          for (const f of ['sl', 'tp']) if (p[f] != null) {
+            const pts = (p[f] - p.entry) * dir(p.side);
+            want(`p${p.id}${f}`, { price: p[f], color: f === 'sl' ? '#ff5252' : '#00c853', lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: `${f.toUpperCase()} #${p.id}  ${money(pts * p.lots * val)}` });
+            dragTargets.push({ kind: 'posStop', obj: p, field: f, price: p[f] });
+          }
         }
+        for (const o of ordList()) {
+          want(`o${o.id}`, { price: o.price, color: '#5aa2ff', lineWidth: 1, lineStyle: LWC.LineStyle.LargeDashed, axisLabelVisible: true, title: `#${o.id} ${o.side.toUpperCase()} ${o.type.toUpperCase()} ${o.lots}` });
+          dragTargets.push({ kind: 'order', obj: o, price: o.price });
+          for (const f of ['sl', 'tp']) if (o[f] != null) {
+            const pts = (o[f] - o.price) * dir(o.side);
+            want(`o${o.id}${f}`, { price: o[f], color: f === 'sl' ? '#ff5252aa' : '#00c853aa', lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: `${f.toUpperCase()} #${o.id}  ${money(pts * o.lots * val)}` });
+            dragTargets.push({ kind: 'orderStop', obj: o, field: f, price: o[f] });
+          }
+        }
+        if (preview) want('preview', { price: preview.price, color: preview.color, lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: preview.title });
       }
-      if (preview) want(desired, 'preview', { price: preview.price, color: preview.color, lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: preview.title });
     }
     for (const [k, line] of lines) if (!desired.has(k)) { candleSeries.removePriceLine(line); lines.delete(k); }
     for (const [k, opts] of desired) {
@@ -676,237 +841,433 @@
     }
   }
 
-  // ---------- markers ----------
   function refreshMarkers() {
-    if (!C || !R.active) { candleSeries.setMarkers([]); return; }
+    const mode = tradeMode();
+    if (!C || !mode) { candleSeries.setMarkers([]); return; }
     const mk = [];
-    const add = (tick, m) => { const ci = D.candleOfTick(C, tick); if (ci <= R.shownCi) mk.push({ time: ci, ...m }); };
-    for (const h of TR.history) {
-      add(h.entryTick, { position: h.side === 'buy' ? 'belowBar' : 'aboveBar', shape: h.side === 'buy' ? 'arrowUp' : 'arrowDown', color: h.side === 'buy' ? '#2f81f7' : '#ff7043', text: `#${h.id}` });
-      add(h.exitTick, { position: h.side === 'buy' ? 'aboveBar' : 'belowBar', shape: 'circle', color: h.pnl >= 0 ? '#2fd16b' : '#ff5c5c', text: money(h.pnl) });
+    const add = (tick, m) => { if (tick < 0 || tick >= ticks.n) return; const ci = D.candleOfTick(C, tick); if (ci <= R.shownCi) mk.push({ time: ci, ...m }); };
+    const arrow = p => ({ position: p.side === 'buy' ? 'belowBar' : 'aboveBar', shape: p.side === 'buy' ? 'arrowUp' : 'arrowDown', color: p.side === 'buy' ? '#2f81f7' : '#ff7043', text: `#${p.id}` });
+    if (mode === 'paper') {
+      for (const h of TR.history) {
+        add(h.entryTick, arrow(h));
+        add(h.exitTick, { position: h.side === 'buy' ? 'aboveBar' : 'belowBar', shape: 'circle', color: h.pnl >= 0 ? '#2fd16b' : '#ff5c5c', text: money(h.pnl) });
+      }
+      for (const p of TR.positions) add(p.entryTick, arrow(p));
+    } else {
+      for (const p of LIVE.positions) if (p.time_msc >= ticks.t[0]) add(Math.min(ticks.n - 1, D.tickAtOrAfter(ticks, p.time_msc)), arrow(p));
     }
-    for (const p of TR.positions) add(p.entryTick, { position: p.side === 'buy' ? 'belowBar' : 'aboveBar', shape: p.side === 'buy' ? 'arrowUp' : 'arrowDown', color: p.side === 'buy' ? '#2f81f7' : '#ff7043', text: `#${p.id}` });
     mk.sort((a, b) => a.time - b.time);
     candleSeries.setMarkers(mk);
   }
 
-  // ---------- validation of dragged levels ----------
   function validStop(side, field, level, ref) {
-    // ref: market price relevant for positions, or order price for pending orders
-    if (field === 'sl') return side === 'buy' ? level < ref : level > ref;
-    return side === 'buy' ? level > ref : level < ref;
+    const md = minStopDist();
+    if (field === 'sl') return side === 'buy' ? level < ref - md : level > ref + md;
+    return side === 'buy' ? level > ref + md : level < ref - md;
   }
 
-  // ---------- dragging ----------
-  let drag = null;
-  function paneY(e) { return e.clientY - chartEl.getBoundingClientRect().top; }
-  function inPane(e) {
-    const r = chartEl.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    return x < r.width - chart.priceScale('right').width() && (e.clientY - r.top) < r.height - chart.timeScale().height();
+  // ====================================================================
+  // Pointer input: drag lines, select lines, tap to place — mouse and touch
+  // ====================================================================
+  let drag = null, tapStart = null;
+  const pt = e => { const t = e.touches ? (e.touches[0] || e.changedTouches[0]) : e; return { x: t.clientX, y: t.clientY }; };
+  function rel(p) { const r = chartEl.getBoundingClientRect(); return { x: p.x - r.left, y: p.y - r.top, w: r.width, h: r.height }; }
+  function inPane(p) {
+    const q = rel(p);
+    return q.x >= 0 && q.y >= 0 && q.x < q.w - chart.priceScale('right').width() && q.y < q.h - chart.timeScale().height();
   }
-  function hitTest(e) {
-    if (!R.active || !dragTargets.length || !inPane(e)) return null;
-    const y = paneY(e);
-    let best = null, bestD = 6;
+  function hitTest(p, tol) {
+    if (!dragTargets.length || !inPane(p)) return null;
+    const y = rel(p).y;
+    let best = null, bestD = tol;
     for (const t of dragTargets) {
       const c = candleSeries.priceToCoordinate(t.price);
       if (c === null) continue;
       const d = Math.abs(c - y);
-      if (d < bestD) { bestD = d; best = t; }
+      if (d < bestD || (d === bestD && t.kind !== 'hline')) { bestD = d; best = t; }
     }
     return best;
   }
-  chartEl.addEventListener('mousedown', e => {
-    if (e.button !== 0 || TR.placing || R.picking) return;
-    const t = hitTest(e);
-    if (!t) return;
-    e.stopPropagation(); e.preventDefault();
+  const priceAtY = y => { const p = candleSeries.coordinateToPrice(y); return p === null ? null : roundP(p); };
+  function stopEvt(e) { e.stopPropagation(); if (e.cancelable) e.preventDefault(); }
+
+  function onDown(e) {
+    const touch = e.type === 'touchstart';
+    if (!touch && e.button !== 0) return;
+    if (touch && e.touches.length > 1) return;
+    const p = pt(e);
+    if (!C || !inPane(p)) return;
+    if (R.picking || TR.placing) { stopEvt(e); tapStart = p; return; }
+    const t = hitTest(p, touch ? 18 : 6);
+    if (!t) { if (HL.selected) { HL.selected = null; syncLines(); scheduleUI(); } return; }
+    stopEvt(e);
     pause();
-    drag = { t, orig: t.kind === 'posStop' || t.kind === 'orderStop' ? t.obj[t.field] : t.obj.price ?? t.obj.entry };
+    const o = t.obj;
+    drag = { t, start: p, moved: false, touch, orig: { price: o.price, entry: o.entry, sl: o.sl, tp: o.tp } };
     chart.applyOptions({ handleScroll: false, handleScale: false });
-    document.addEventListener('mousemove', onDragMove);
-    document.addEventListener('mouseup', onDragEnd);
-  }, true);
-  chartEl.addEventListener('mousemove', e => {
-    if (drag) return;
-    chartEl.classList.toggle('drag-hover', !!hitTest(e) && !TR.placing && !R.picking);
-  });
-  function priceAt(e) { const p = candleSeries.coordinateToPrice(paneY(e)); return p === null ? null : roundP(p); }
-  function onDragMove(e) {
-    const price = priceAt(e);
-    if (price === null) return;
-    const { t } = drag;
-    if (t.kind === 'posStop' || t.kind === 'orderStop') t.obj[t.field] = price;
-    else if (t.kind === 'order') {
-      const d = price - t.obj.price;
-      t.obj.price = price;
-      if (t.obj.sl != null) t.obj.sl = roundP(t.obj.sl + d);  // stops move with the order
-      if (t.obj.tp != null) t.obj.tp = roundP(t.obj.tp + d);
-    } else if (t.kind === 'posEntry') {
-      const p = t.obj;
-      const isTP = (price - p.entry) * dir(p.side) > 0;
-      const pts = (price - p.entry) * dir(p.side);
-      preview = { price, color: isTP ? '#00c853' : '#ff5252', title: `${isTP ? 'TP' : 'SL'} #${p.id}  ${money(pts * p.lots * vpp())}` };
-    }
-    syncLines();
+    if (touch) { document.addEventListener('touchmove', onMove, { passive: false }); document.addEventListener('touchend', onUp); document.addEventListener('touchcancel', onUp); }
+    else { document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp); }
   }
-  function onDragEnd(e) {
-    document.removeEventListener('mousemove', onDragMove);
-    document.removeEventListener('mouseup', onDragEnd);
+  function onMove(e) {
+    if (!drag) return;
+    if (e.cancelable) e.preventDefault();
+    const p = pt(e);
+    if (!drag.moved && Math.abs(p.y - drag.start.y) < (drag.touch ? 6 : 3)) return;
+    drag.moved = true;
+    const price = priceAtY(rel(p).y);
+    if (price === null) return;
+    const { t } = drag, o = t.obj;
+    if (t.kind === 'hline') o.price = price;
+    else if (t.kind === 'posStop' || t.kind === 'orderStop') o[t.field] = price;
+    else if (t.kind === 'order') {
+      const d = price - o.price;
+      o.price = price;
+      if (o.sl != null) o.sl = roundP(o.sl + d);
+      if (o.tp != null) o.tp = roundP(o.tp + d);
+    } else if (t.kind === 'posEntry') {
+      const pts = (price - o.entry) * dir(o.side), isTP = pts > 0;
+      preview = { price, color: isTP ? '#00c853' : '#ff5252', title: `${isTP ? 'TP' : 'SL'} #${o.id}  ${money(pts * o.lots * vpp())}` };
+    }
+    syncLines(); drawLineMenu();
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp);
+    document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); document.removeEventListener('touchcancel', onUp);
     chart.applyOptions({ handleScroll: true, handleScale: true });
-    const { t, orig } = drag;
+    if (!drag) return;
+    const { t, orig, moved } = drag;
     drag = null;
-    const i = R.cursor, b = ticks.bid[i], a = ticks.ask[i];
+    const o = t.obj;
+    if (!moved) {
+      if (t.kind === 'hline') { HL.selected = o.id; syncLines(); scheduleUI(); }
+      return;
+    }
+    const b = bidNow(), a = askNow();
+    if (t.kind === 'hline') { saveLines(); scheduleUI(); return; }
     if (t.kind === 'posStop') {
-      const p = t.obj, ref = p.side === 'buy' ? b : a;
-      if (!validStop(p.side, t.field, p[t.field], ref)) { p[t.field] = orig; toast(`Invalid ${t.field.toUpperCase()}: it would trigger immediately`); }
+      const nv = o[t.field]; o[t.field] = orig[t.field];
+      if (!validStop(o.side, t.field, nv, o.side === 'buy' ? b : a)) { toast(`That ${t.field.toUpperCase()} is too close to the price or on the wrong side`); render(false); return; }
+      setPosStops(o, t.field === 'sl' ? nv : o.sl, t.field === 'tp' ? nv : o.tp);
     } else if (t.kind === 'orderStop') {
-      const o = t.obj;
-      if (!validStop(o.side, t.field, o[t.field], o.price)) { o[t.field] = orig; toast(`Invalid ${t.field.toUpperCase()} for this order`); }
+      const nv = o[t.field]; o[t.field] = orig[t.field];
+      if (!validStop(o.side, t.field, nv, o.price)) { toast(`Invalid ${t.field.toUpperCase()} for this order`); render(false); return; }
+      modifyOrder(o, o.price, t.field === 'sl' ? nv : o.sl, t.field === 'tp' ? nv : o.tp);
     } else if (t.kind === 'order') {
-      const o = t.obj, nt = orderType(o.side, o.price);
-      if (nt !== o.type) { o.type = nt; toast(`Order changed to ${o.side.toUpperCase()} ${nt.toUpperCase()}`); }
+      const np = o.price, nsl = o.sl, ntp = o.tp;
+      Object.assign(o, { price: orig.price, sl: orig.sl, tp: orig.tp });
+      const nt = orderType(o.side, np);
+      if (nt !== o.type) {
+        if (tradeMode() === 'live') { toast('Moving an order across the market would change its type. Cancel it and place a new one.', 5000); render(false); return; }
+        o.type = nt; toast(`Order changed to ${o.side.toUpperCase()} ${nt.toUpperCase()}`);
+      }
+      modifyOrder(o, np, nsl, ntp);
     } else if (t.kind === 'posEntry' && preview) {
-      const p = t.obj, price = preview.price;
-      const field = (price - p.entry) * dir(p.side) > 0 ? 'tp' : 'sl';
+      const price = preview.price;
       preview = null;
-      if (validStop(p.side, field, price, p.side === 'buy' ? b : a)) p[field] = price;
-      else toast(`Invalid ${field.toUpperCase()}: it would trigger immediately`);
+      const field = (price - o.entry) * dir(o.side) > 0 ? 'tp' : 'sl';
+      if (!validStop(o.side, field, price, o.side === 'buy' ? b : a)) { toast(`That ${field.toUpperCase()} is too close to the price or on the wrong side`); render(false); return; }
+      setPosStops(o, field === 'sl' ? price : o.sl, field === 'tp' ? price : o.tp);
     }
     preview = null;
     render(false);
   }
-
-  // Chart clicks: choose replay start / place pending order.
-  // Handled directly (not via chart.subscribeClick) so quick successive clicks are never
-  // swallowed as a double-click, and so the chart doesn't pan while in these modes.
-  let clickDown = null;
-  chartEl.addEventListener('mousedown', e => {
-    if (e.button !== 0 || !C || !(R.picking || TR.placing) || !inPane(e)) return;
-    e.stopPropagation(); e.preventDefault();
-    clickDown = { x: e.clientX, y: e.clientY };
-  }, true);
-  chartEl.addEventListener('mouseup', e => {
-    if (!clickDown) return;
-    const moved = Math.hypot(e.clientX - clickDown.x, e.clientY - clickDown.y);
-    clickDown = null;
-    if (moved > 6) return;
-    const r = chartEl.getBoundingClientRect();
+  function onTapEnd(e) {
+    if (!tapStart) return;
+    const p = pt(e);
+    const moved = Math.hypot(p.x - tapStart.x, p.y - tapStart.y);
+    tapStart = null;
+    if (moved > 10) return;
+    stopEvt(e);
+    const q = rel(p);
     if (R.picking) {
-      const logical = chart.timeScale().coordinateToLogical(e.clientX - r.left);
+      const logical = chart.timeScale().coordinateToLogical(q.x);
       if (logical === null) return;
       const idx = Math.min(R.active ? R.shownCi : C.n - 1, Math.max(0, Math.round(logical)));
       startReplayAt(C.end[idx]);
     } else if (TR.placing) {
-      const price = candleSeries.coordinateToPrice(e.clientY - r.top);
-      const side = TR.placing;
+      const price = priceAtY(q.y);
+      const what = TR.placing;
       cancelPlacing();
-      if (price !== null) placePending(side, price);
+      if (price === null) return;
+      if (what === 'hline') addLine(price); else placePending(what, price);
     }
-  }, true);
+  }
+  chartEl.addEventListener('mousedown', onDown, true);
+  chartEl.addEventListener('touchstart', onDown, { capture: true, passive: false });
+  chartEl.addEventListener('mouseup', onTapEnd, true);
+  chartEl.addEventListener('touchend', onTapEnd, { capture: true, passive: false });
+  chartEl.addEventListener('mousemove', e => {
+    if (drag) return;
+    chartEl.classList.toggle('drag-hover', !!hitTest(pt(e), 6) && !TR.placing && !R.picking);
+  });
 
   $('btnBuy').addEventListener('click', () => marketOrder('buy'));
   $('btnSell').addEventListener('click', () => marketOrder('sell'));
   $('btnBuyLimit').addEventListener('click', () => TR.placing === 'buy' ? cancelPlacing() : startPlacing('buy'));
   $('btnSellLimit').addEventListener('click', () => TR.placing === 'sell' ? cancelPlacing() : startPlacing('sell'));
+  $('ocConfirm').addEventListener('change', e => { S.trade.confirm = !e.target.checked; saveSettings(); });
 
-  // ---------- tables ----------
+  // ====================================================================
+  // Tables + account summary
+  // ====================================================================
   function drawTables() {
+    const mode = tradeMode();
     const rows = [];
-    if (ticks && R.active) {
-      for (const p of TR.positions) {
-        const lp = livePnL(p), cls = lp.pnl >= 0 ? 'pos' : 'neg';
+    if (ticks && mode) {
+      for (const p of posList()) {
+        const lp = pnlOf(p), cls = lp.pnl >= 0 ? 'pos' : 'neg';
         rows.push(`<tr><td>${p.id}</td><td>${p.side}</td><td>${p.lots}</td><td>${fmtP(p.entry)}</td>
           <td>${p.sl != null ? fmtP(p.sl) + ` <button class="x" data-act="rmsl" data-id="${p.id}" title="Remove S/L">✕</button>` : `<button class="lnk" data-act="addsl" data-id="${p.id}">+SL</button>`}</td>
           <td>${p.tp != null ? fmtP(p.tp) + ` <button class="x" data-act="rmtp" data-id="${p.id}" title="Remove T/P">✕</button>` : `<button class="lnk" data-act="addtp" data-id="${p.id}">+TP</button>`}</td>
           <td>${fmtP(lp.cur)}</td><td class="${cls}">${lp.points.toFixed(digits())}</td><td class="${cls}">${money(lp.pnl)}</td>
           <td><button class="x" data-act="close" data-id="${p.id}" title="Close position">✕ close</button></td></tr>`);
       }
-      for (const o of TR.orders) {
+      for (const o of ordList()) {
         rows.push(`<tr class="pending"><td>${o.id}</td><td>${o.side} ${o.type}</td><td>${o.lots}</td><td>${fmtP(o.price)}</td>
           <td>${o.sl != null ? fmtP(o.sl) : `<button class="lnk" data-act="oaddsl" data-id="${o.id}">+SL</button>`}</td>
           <td>${o.tp != null ? fmtP(o.tp) : `<button class="lnk" data-act="oaddtp" data-id="${o.id}">+TP</button>`}</td>
-          <td>${fmtP(o.side === 'buy' ? ticks.ask[R.cursor] : ticks.bid[R.cursor])}</td><td></td><td>pending</td>
+          <td>${fmtP(o.side === 'buy' ? askNow() : bidNow())}</td><td></td><td>pending</td>
           <td><button class="x" data-act="cancel" data-id="${o.id}" title="Cancel order">✕ cancel</button></td></tr>`);
       }
     }
-    const openHtml = rows.join('') || `<tr><td colspan="10" class="muted">${R.active ? 'No open positions. Use BUY / SELL (or keys B / S), or Buy/Sell Limit and click the chart. Drag lines to move S/L, T/P and orders; drag a position line to add S/L or T/P.' : 'Start a replay (⏪ Replay) to paper trade.'}</td></tr>`;
+    const empty = !mode ? (LIVE.bridge ? 'Press ● Live to trade your MT5 account, or start a Replay to paper trade.' : 'Start a replay (⏪ Replay) to paper trade.')
+      : 'No open positions. BUY / SELL (keys B / S), or Buy/Sell Limit then tap the chart. Drag lines to move S/L, T/P and orders; drag a position line to add S/L or T/P.';
+    const openHtml = rows.join('') || `<tr><td colspan="10" class="muted">${empty}</td></tr>`;
     const openRows = $('openRows');
     if (openRows._html !== openHtml) { openRows.innerHTML = openHtml; openRows._html = openHtml; }
 
-    const hist = TR.history.slice().reverse().map(h => `<tr><td>${h.id}</td><td>${h.side}</td><td>${h.lots}</td><td>${fmtShort(ticks.t[h.entryTick])}:${pad(new Date(ticks.t[h.entryTick]).getUTCSeconds())}</td><td>${fmtP(h.entry)}</td>
-      <td>${fmtShort(ticks.t[h.exitTick])}:${pad(new Date(ticks.t[h.exitTick]).getUTCSeconds())}</td><td>${fmtP(h.exit)}</td><td>${h.reason}</td>
+    const hist = TR.history.slice().reverse().map(h => `<tr><td>${h.id}</td><td>${h.side}</td><td>${h.lots}</td><td>${fmtSec(ticks.t[h.entryTick])}</td><td>${fmtP(h.entry)}</td>
+      <td>${fmtSec(ticks.t[h.exitTick])}</td><td>${fmtP(h.exit)}</td><td>${h.reason}</td>
       <td class="${h.pnl >= 0 ? 'pos' : 'neg'}">${h.points.toFixed(digits())}</td><td class="${h.pnl >= 0 ? 'pos' : 'neg'}">${money(h.pnl)}</td></tr>`).join('');
     const histRows = $('histRows');
-    const histHtml = hist || '<tr><td colspan="10" class="muted">No closed trades yet.</td></tr>';
+    const histHtml = hist || `<tr><td colspan="10" class="muted">No closed paper trades yet.${LIVE.bridge ? ' Closed live trades are in MT5 (History tab).' : ''}</td></tr>`;
     if (histRows._html !== histHtml) { histRows.innerHTML = histHtml; histRows._html = histHtml; }
 
-    // account summary
-    const open = (ticks && R.active) ? TR.positions.reduce((s, p) => s + livePnL(p).pnl, 0) : 0;
-    const n = TR.history.length, wins = TR.history.filter(h => h.pnl > 0).length;
-    const net = TR.history.reduce((s, h) => s + h.pnl, 0);
-    const pts = TR.history.reduce((s, h) => s + h.points, 0);
     const cur = currency();
-    $('acct').innerHTML = `<span>Balance <b>${TR.balance.toFixed(2)}</b> ${cur}</span><span>Equity <b>${(TR.balance + open).toFixed(2)}</b></span>` +
-      `<span>Open <b class="${open >= 0 ? 'pos' : 'neg'}">${money(open)}</b></span>` +
-      `<span>Trades <b>${n}</b>${n ? ` · Win <b>${(wins / n * 100).toFixed(0)}%</b>` : ''}</span>` +
-      `<span>Net <b class="${net >= 0 ? 'pos' : 'neg'}">${money(net)}</b> (${pts >= 0 ? '+' : ''}${pts.toFixed(1)} pts)</span>`;
+    let html;
+    if (mode === 'live' && LIVE.account) {
+      const a = LIVE.account;
+      html = `<span class="acct-tag ${a.demo ? 'demo' : 'real'}">${a.demo ? 'DEMO' : 'LIVE'} ${a.login}</span>` +
+        `<span>Balance <b>${a.balance.toFixed(2)}</b> ${a.currency}</span><span>Equity <b>${a.equity.toFixed(2)}</b></span>` +
+        `<span>Open <b class="${a.profit >= 0 ? 'pos' : 'neg'}">${money(a.profit)}</b></span><span>Free margin <b>${a.free_margin.toFixed(2)}</b></span>`;
+    } else {
+      const open = mode === 'paper' ? TR.positions.reduce((s, p) => s + pnlOf(p).pnl, 0) : 0;
+      const n = TR.history.length, wins = TR.history.filter(h => h.pnl > 0).length;
+      const net = TR.history.reduce((s, h) => s + h.pnl, 0);
+      const pts = TR.history.reduce((s, h) => s + h.points, 0);
+      html = `<span class="acct-tag paper">PAPER</span><span>Balance <b>${TR.balance.toFixed(2)}</b> ${cur}</span><span>Equity <b>${(TR.balance + open).toFixed(2)}</b></span>` +
+        `<span>Open <b class="${open >= 0 ? 'pos' : 'neg'}">${money(open)}</b></span>` +
+        `<span>Trades <b>${n}</b>${n ? ` · Win <b>${(wins / n * 100).toFixed(0)}%</b>` : ''}</span>` +
+        `<span>Net <b class="${net >= 0 ? 'pos' : 'neg'}">${money(net)}</b> (${pts >= 0 ? '+' : ''}${pts.toFixed(1)} pts)</span>`;
+    }
+    const acct = $('acct');
+    if (acct._html !== html) { acct.innerHTML = html; acct._html = html; }
   }
 
   $('openRows').addEventListener('click', e => {
-    const btn = e.target.closest('button'); if (!btn || !R.active) return;
-    const id = +btn.dataset.id, act = btn.dataset.act, i = R.cursor;
-    const p = TR.positions.find(x => x.id === id), o = TR.orders.find(x => x.id === id);
-    const dist = () => +S.trade.slPts > 0 ? +S.trade.slPts : Math.max(Math.pow(10, -digits()) * 10, ticks.bid[i] * 0.001);
-    const distTp = () => +S.trade.tpPts > 0 ? +S.trade.tpPts : dist();
-    if (act === 'close' && p) closePosition(p, p.side === 'buy' ? ticks.bid[i] : ticks.ask[i], i, 'manual');
-    else if (act === 'cancel' && o) TR.orders = TR.orders.filter(x => x !== o);
-    else if (act === 'addsl' && p) p.sl = roundP((p.side === 'buy' ? ticks.bid[i] : ticks.ask[i]) - dir(p.side) * dist());
-    else if (act === 'addtp' && p) p.tp = roundP((p.side === 'buy' ? ticks.bid[i] : ticks.ask[i]) + dir(p.side) * distTp());
-    else if (act === 'rmsl' && p) p.sl = null;
-    else if (act === 'rmtp' && p) p.tp = null;
-    else if (act === 'oaddsl' && o) o.sl = roundP(o.price - dir(o.side) * dist());
-    else if (act === 'oaddtp' && o) o.tp = roundP(o.price + dir(o.side) * distTp());
-    render(false);
+    const btn = e.target.closest('button'); if (!btn || !tradeMode()) return;
+    const id = +btn.dataset.id, act = btn.dataset.act;
+    const p = posList().find(x => x.id === id), o = ordList().find(x => x.id === id);
+    const md = minStopDist();
+    const dist = () => Math.max(md * 1.5, +S.trade.slPts > 0 ? +S.trade.slPts : Math.max(Math.pow(10, -digits()) * 10, bidNow() * 0.001));
+    const distTp = () => Math.max(md * 1.5, +S.trade.tpPts > 0 ? +S.trade.tpPts : dist());
+    const ref = p ? (p.side === 'buy' ? bidNow() : askNow()) : 0;
+    if (act === 'close' && p) closePos(p);
+    else if (act === 'cancel' && o) cancelOrder(o);
+    else if (act === 'addsl' && p) setPosStops(p, roundP(ref - dir(p.side) * dist()), p.tp);
+    else if (act === 'addtp' && p) setPosStops(p, p.sl, roundP(ref + dir(p.side) * distTp()));
+    else if (act === 'rmsl' && p) setPosStops(p, null, p.tp);
+    else if (act === 'rmtp' && p) setPosStops(p, p.sl, null);
+    else if (act === 'oaddsl' && o) modifyOrder(o, o.price, roundP(o.price - dir(o.side) * dist()), o.tp);
+    else if (act === 'oaddtp' && o) modifyOrder(o, o.price, o.sl, roundP(o.price + dir(o.side) * distTp()));
   });
 
   function tradesCsv() {
-    const head = 'id,side,lots,open_time,open_price,close_time,close_price,reason,points,profit,sl,tp';
+    const head = `id,side,lots,open_time (${TT.zoneLabel(S.tz)}),open_price,close_time,close_price,reason,points,profit,sl,tp`;
     const rows = TR.history.map(h => [h.id, h.side, h.lots, fmtIso(ticks.t[h.entryTick]), h.entry, fmtIso(ticks.t[h.exitTick]), h.exit, h.reason, h.points.toFixed(digits()), h.pnl.toFixed(2), h.sl ?? '', h.tp ?? ''].join(','));
     return head + '\n' + rows.join('\n') + '\n';
   }
   $('btnExport').addEventListener('click', () => {
     if (!TR.history.length) return toast('No trades to export');
-    const blob = new Blob([tradesCsv()], { type: 'text/csv' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    a.href = URL.createObjectURL(new Blob([tradesCsv()], { type: 'text/csv' }));
     a.download = `trades_${symbolKey() || 'tickchart'}_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   });
-  // Two-click confirmation (browser confirm() dialogs are blocked in some embedded viewers).
   const btnReset = $('btnResetAcct');
   btnReset.addEventListener('click', () => {
     if (btnReset.dataset.armed) {
-      clearTimeout(btnReset._t); delete btnReset.dataset.armed; btnReset.textContent = 'Reset account';
+      clearTimeout(btnReset._t); delete btnReset.dataset.armed; btnReset.textContent = 'Reset paper account';
       resetAccount(false);
     } else {
       btnReset.dataset.armed = '1'; btnReset.textContent = 'Click again to reset';
-      btnReset._t = setTimeout(() => { delete btnReset.dataset.armed; btnReset.textContent = 'Reset account'; }, 3000);
+      btnReset._t = setTimeout(() => { delete btnReset.dataset.armed; btnReset.textContent = 'Reset paper account'; }, 3000);
     }
   });
   $('btnCopyCsv').addEventListener('click', () => {
     if (!TR.history.length) return toast('No trades to copy');
-    const csv = tradesCsv();
-    navigator.clipboard.writeText(csv).then(() => toast('Trade log copied. Paste it into Excel or a text file.'))
+    navigator.clipboard.writeText(tradesCsv()).then(() => toast('Trade log copied. Paste it into Excel or a text file.'))
       .catch(() => toast('Copy was blocked by the browser'));
   });
 
-  // tabs
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
     document.querySelectorAll('.tabBody').forEach(b => b.classList.toggle('hidden', b.id !== t.dataset.tab));
+    if (!S.panelOpen) { S.panelOpen = true; applyPanel(); saveSettings(); }
   }));
+  function applyPanel() { $('panel').classList.toggle('collapsed', !S.panelOpen); $('btnPanel').textContent = S.panelOpen ? '▾' : '▴'; }
+  $('btnPanel').addEventListener('click', () => { S.panelOpen = !S.panelOpen; applyPanel(); saveSettings(); });
+  $('btnInfo').addEventListener('click', () => { S.infoOpen = !S.infoOpen; saveSettings(); scheduleUI(); });
+  applyPanel();
+
+  // ====================================================================
+  // Live mode (bridge)
+  // ====================================================================
+  const liveSymEl = $('liveSymbol'), btnLive = $('btnLive');
+  function drawLiveStatus() {
+    const el = $('liveStatus');
+    if (!LIVE.bridge) { el.className = 'hidden'; return; }
+    btnLive.classList.toggle('active', LIVE.on);
+    btnLive.textContent = LIVE.on ? '● Live' : '○ Live';
+    if (!LIVE.on) { el.className = 'chip'; el.textContent = 'Live off'; return; }
+    if (!LIVE.connected) { el.className = 'chip warn'; el.textContent = 'Reconnecting…'; return; }
+    const a = LIVE.account;
+    el.className = 'chip ' + (a && !a.demo ? 'real' : 'ok');
+    el.textContent = a ? `${a.demo ? 'DEMO' : 'LIVE'} ${a.login} · ${a.hedging ? 'hedging' : 'netting'}` : 'Connected';
+  }
+  async function prevDay(symbol, before) {
+    try { return await (await api(`api/prevday?symbol=${encodeURIComponent(symbol)}&before=${before}`)).json(); } catch (e) { return null; }
+  }
+  async function fetchTicks(symbol, from, to) {
+    const txt = await (await api(`api/ticks?symbol=${encodeURIComponent(symbol)}&from=${Math.floor(from)}&to=${Math.ceil(to)}`)).text();
+    return D.parseTicks(txt, symbol + '.csv');
+  }
+  async function refreshInfo() {
+    const info = await (await api('api/info')).json();
+    LIVE.bridge = info; LIVE.account = info.account; LIVE.trading = info.trading;
+    return info;
+  }
+
+  async function startLive(symbol) {
+    symbol = symbol || liveSymEl.value;
+    if (!symbol) return;
+    stopReplay(true); stopLive();
+    busy(true, `Loading ${symbol} from MT5…`);
+    try {
+      const info = await refreshInfo();
+      LIVE.symInfo = info.symbols.find(s => s.name === symbol) || null;
+      const now = info.server_time_ms || (Date.now() + TT.serverOffset(Date.now(), S.tz.server));
+      const todayStart = Math.floor(now / DAY) * DAY;
+      const pd = await prevDay(symbol, todayStart);          // previous trading day (shown for context)
+      const from = pd ? pd.time : todayStart - DAY;
+      const pp = await prevDay(symbol, from);                // its previous day: CPR for the first day
+      runtimeHLC = pp ? { h: pp.h, l: pp.l, c: pp.c } : null;
+      const tk = await fetchTicks(symbol, from, now + 3600000);
+      tk.symbol = symbol;
+      sources = [];
+      LIVE.symbol = symbol; S.liveSymbol = symbol; saveSettings();
+      LIVE.on = true;
+      setTicks(tk, { quiet: true });
+      connectWS();
+      toast(`Live: ${symbol}. Showing ${days.map(d => dayName(d.day)).join(' + ')}.`);
+    } catch (e) {
+      LIVE.on = false;
+      toast(`Could not start live data: ${e.message}`, 7000);
+    } finally { busy(false); drawLiveStatus(); }
+  }
+  function stopLive() {
+    if (!LIVE.on && !LIVE.ws) return;
+    LIVE.on = false;
+    clearTimeout(LIVE.reconnectT);
+    if (LIVE.ws) { LIVE.ws.onclose = null; try { LIVE.ws.close(); } catch (e) { /* ignore */ } LIVE.ws = null; }
+    LIVE.connected = false; LIVE.positions = []; LIVE.orders = [];
+    cancelPlacing();
+    scheduleUI();
+  }
+  function connectWS() {
+    if (LIVE.ws) { LIVE.ws.onclose = null; try { LIVE.ws.close(); } catch (e) { /* ignore */ } }
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    LIVE.ws = ws;
+    ws.onopen = () => {
+      LIVE.connected = true; LIVE.retry = 0;
+      let since = 0, sinceN = 0;
+      if (ticks && ticks.n) { since = ticks.t[ticks.n - 1]; for (let i = ticks.n - 1; i >= 0 && ticks.t[i] === since; i--) sinceN++; }
+      ws.send(JSON.stringify({ type: 'subscribe', symbol: LIVE.symbol, since, since_n: sinceN }));
+      drawLiveStatus();
+    };
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'ticks' && m.symbol === LIVE.symbol && LIVE.on) onLiveTicks(m.rows);
+      else if (m.type === 'account' && LIVE.on) onSnapshot(m);
+    };
+    ws.onclose = () => {
+      LIVE.connected = false; drawLiveStatus();
+      if (!LIVE.on) return;
+      const wait = Math.min(10000, 1000 * Math.pow(2, LIVE.retry++));
+      LIVE.reconnectT = setTimeout(connectWS, wait);
+    };
+  }
+  function onLiveTicks(rows) {
+    if (!ticks || !rows.length) return;
+    const n0 = ticks.n;
+    D.appendTicks(ticks, rows);
+    if (ticks.n === n0) return;
+    const cBefore = C.n, dBefore = days.length;
+    D.extendCandles(C, ticks);
+    D.updateDays(days, ticks, n0);
+    if (days.length !== dBefore) rebuildCPRMap();
+    if (C.n !== cBefore) rebuildMAs();
+    render(false);
+  }
+  function onSnapshot(m) {
+    LIVE.account = m.account; LIVE.trading = m.trading || LIVE.trading;
+    if (drag || LIVE.inflight || performance.now() < LIVE.ignoreSnapUntil) { scheduleUI(); return; }
+    LIVE.positions = (m.positions || []).map(p => ({ id: p.ticket, side: p.side, lots: p.lots, entry: p.entry, sl: p.sl, tp: p.tp, profit: p.profit, time_msc: p.time_msc, live: true }));
+    LIVE.orders = (m.orders || []).map(o => ({ id: o.ticket, side: o.side, type: o.type, price: o.price, lots: o.lots, sl: o.sl, tp: o.tp, live: true }));
+    refreshMarkers(); syncLines(); scheduleUI();
+  }
+  btnLive.addEventListener('click', () => { if (LIVE.on) { stopLive(); render(true); } else startLive(); });
+  liveSymEl.addEventListener('change', () => { liveSymEl.blur(); startLive(liveSymEl.value); });
+  $('btnHist').addEventListener('click', async () => {
+    const symbol = liveSymEl.value;
+    const f = $('histFrom').value, t = $('histTo').value || f;
+    if (!f) return toast('Pick the first trading day');
+    const from = Date.parse(f + 'T00:00:00Z'), to = Date.parse(t + 'T00:00:00Z') + DAY;
+    if (!(to > from)) return toast('The last day must be on or after the first day');
+    stopReplay(true); stopLive();
+    busy(true, `Loading ${symbol} ${f} → ${t} from MT5…`);
+    try {
+      await refreshInfo();
+      LIVE.symInfo = LIVE.bridge.symbols.find(s => s.name === symbol) || null;
+      const pd = await prevDay(symbol, from);
+      runtimeHLC = pd ? { h: pd.h, l: pd.l, c: pd.c } : null;
+      const tk = await fetchTicks(symbol, from, to);
+      tk.symbol = symbol; sources = [];
+      LIVE.symbol = symbol;
+      setTicks(tk);
+    } catch (e) { toast(`Could not load history: ${e.message}`, 7000); }
+    finally { busy(false); drawLiveStatus(); }
+  });
+
+  async function detectBridge() {
+    if (!/^https?:$/.test(location.protocol)) return;
+    let info;
+    try { info = await refreshInfo(); } catch (e) { return; }
+    document.body.classList.add('bridge');
+    liveSymEl.innerHTML = info.symbols.map(s => `<option value="${s.name}">${s.name}</option>`).join('');
+    if (info.symbols.some(s => s.name === S.liveSymbol)) liveSymEl.value = S.liveSymbol;
+    const today = isoDate(info.server_time_ms || Date.now());
+    $('histFrom').value = today; $('histTo').value = today;
+    lotsEl.max = info.limits.max_lots;
+    // Check the time-zone rule against the live server clock (only meaningful while ticks are fresh)
+    if (info.server_time_ms) {
+      const chk = TT.ruleMatches(info.server_time_ms, S.tz);
+      if (Math.abs(info.server_time_ms - (info.now_ms + chk.measured * 3600000)) < 600000 && chk.measured !== chk.expected)
+        toast(`Note: the MT5 server looks like GMT${chk.measured >= 0 ? '+' : ''}${chk.measured}. Check Settings → Time if times look wrong.`, 8000);
+    }
+    drawLiveStatus();
+    if (info.symbols.length) startLive(liveSymEl.value);
+  }
 
   // ====================================================================
   // Settings dialog
@@ -920,6 +1281,9 @@
       const v = el.name === 'vpp' ? vpp() : el.name === 'cur' ? currency() : getPath(S, el.name);
       if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? '';
     }
+    const fromMt5 = !!symInfo();
+    form.elements.vpp.disabled = fromMt5; form.elements.cur.disabled = fromMt5;
+    $('vppNote').textContent = fromMt5 ? 'Taken from MT5 for this symbol.' : 'Saved per symbol. GER40 is usually 10 EUR (contract size 10), XAUUSD 100 USD.';
     dlg.showModal();
   });
   dlg.addEventListener('close', () => {
@@ -927,8 +1291,8 @@
     const before = JSON.stringify([S.countMode, S.syncDay]);
     const beforeHLC = JSON.stringify(S.firstHLC);
     for (const el of form.elements) {
-      if (!el.name) continue;
-      let v = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? (el.value === '' ? 0 : +el.value) : el.value);
+      if (!el.name || el.disabled) continue;
+      const v = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? (el.value === '' ? 0 : +el.value) : el.value);
       if (el.name === 'vpp') { if (ticks) S.vppBySymbol[symbolKey()] = v; continue; }
       if (el.name === 'cur') { if (ticks) S.curBySymbol[symbolKey()] = v; continue; }
       setPath(S, el.name, v);
@@ -936,33 +1300,38 @@
     saveSettings();
     applySeriesStyles();
     if (!ticks) return;
-    if (JSON.stringify(S.firstHLC) !== beforeHLC) cprMap = D.buildCPR(days, S.firstHLC);
+    if (JSON.stringify(S.firstHLC) !== beforeHLC) rebuildCPRMap();
     if (JSON.stringify([S.countMode, S.syncDay]) !== before) rebuildCandles(); else rebuildMAs();
     R.shownCi = -1;
     render(true);
+    chart.applyOptions({});   // refresh time labels for a new time zone
   });
 
   // ====================================================================
   // Keyboard
   // ====================================================================
   document.addEventListener('keydown', e => {
-    if (e.target.matches('input, select, textarea') || dlg.open) return;
-    if (e.key === 'Escape') { cancelPlacing(); if (R.picking) btnReplay.click(); return; }
+    if (e.target.matches('input, select, textarea') || dlg.open || confirmDlg.open) return;
+    if (e.key === 'Escape') { cancelPlacing(); if (R.picking) btnReplay.click(); if (HL.selected) { HL.selected = null; syncLines(); scheduleUI(); } return; }
+    if ((e.key === 'Delete' || e.key === 'Backspace') && HL.selected) { e.preventDefault(); deleteSelectedLine(); return; }
+    if (e.key === 'h' || e.key === 'H') { if (ticks) startPlacing('hline'); return; }
+    if (tradeMode() && (e.key === 'b' || e.key === 'B')) { marketOrder('buy'); return; }
+    if (tradeMode() && (e.key === 's' || e.key === 'S')) { marketOrder('sell'); return; }
     if (!R.active) return;
     if (e.code === 'Space') { e.preventDefault(); R.playing ? pause() : play(); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); pause(); advanceTo(e.shiftKey ? R.cursor + 1 : endOfNextCandle(R.cursor)); }
-    else if (e.key === 'b' || e.key === 'B') marketOrder('buy');
-    else if (e.key === 's' || e.key === 'S') marketOrder('sell');
   });
 
-  // Give keyboard shortcuts back to the chart after using a toolbar control.
   ['speedMode', 'speed', 'tickSize', 'demoSelect'].forEach(id => $(id).addEventListener('change', e => e.target.blur()));
   document.querySelectorAll('#toolbar button, #oneClick button, #panel button').forEach(el => el.addEventListener('click', () => el.blur()));
 
   setReplayButtons();
   applySeriesStyles();
   drawTables();
+  detectBridge();
 
-  // expose for debugging / tests
-  window.TickChartApp = { get ticks() { return ticks; }, get candles() { return C; }, R, TR, setTicks, startReplayAt, advanceTo, marketOrder, placePending, chart, candleSeries };
+  window.TickChartApp = {
+    get ticks() { return ticks; }, get candles() { return C; }, R, TR, LIVE, HL, S,
+    setTicks, startReplayAt, advanceTo, marketOrder, placePending, addLine, startLive, stopLive, chart, candleSeries
+  };
 })();

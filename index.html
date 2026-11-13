@@ -2,29 +2,42 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1b1d22">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Tick Chart</title>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
 <header id="toolbar">
+  <div class="group bridge-only">
+    <button id="btnLive" class="btn live" title="Live chart and trading from MT5">○ Live</button>
+    <select id="liveSymbol" title="Symbol"></select>
+    <span id="liveStatus" class="hidden"></span>
+  </div>
   <div class="group">
     <label class="btn" title="Open one or more MT5 tick exports (.csv / .txt). Select several files to combine days.">📂 Open ticks<input type="file" id="fileInput" accept=".csv,.txt,.tsv" multiple hidden></label>
     <label class="btn hidden" id="addBtn" title="Add more days (same symbol) to the loaded data">➕ Add days<input type="file" id="addInput" accept=".csv,.txt,.tsv" multiple hidden></label>
-    <select id="demoSelect" title="Load generated demo data to try the app">
+    <select id="demoSelect" class="no-bridge" title="Load generated demo data to try the app">
       <option value="">Demo data…</option>
       <option value="GER40">GER40 demo</option>
       <option value="XAUUSD">XAUUSD demo</option>
     </select>
   </div>
+  <div class="group bridge-only" title="Load tick history straight from MT5 (trading days, server dates)">
+    <span class="lbl">History</span>
+    <input type="date" id="histFrom"><span class="lbl">→</span><input type="date" id="histTo">
+    <button id="btnHist" class="btn">Load</button>
+  </div>
   <div class="group">
     <span class="lbl">Ticks/candle</span>
-    <input type="number" id="tickSize" min="2" max="100000" step="1" list="tickPresets" class="num">
+    <input type="number" id="tickSize" min="2" max="100000" step="1" list="tickPresets" class="num s2">
     <datalist id="tickPresets"><option value="10"><option value="25"><option value="50"><option value="100"><option value="144"><option value="233"><option value="377"><option value="500"><option value="1000"></datalist>
-    <button id="btnSettings" class="btn" title="Indicators, trading and display settings">⚙ Settings</button>
+    <button id="btnHLine" class="btn" title="Draw a horizontal line (H). Tap a line to recolour or delete it; drag to move it.">─ Line</button>
+    <button id="btnSettings" class="btn" title="Indicators, time zone, trading settings">⚙</button>
   </div>
   <div class="group" id="replayGroup">
-    <button id="btnReplay" class="btn" title="Start/stop replay. Then click a candle (or use the date box) to choose the start">⏪ Replay</button>
+    <button id="btnReplay" class="btn" title="Start/stop replay. Then tap a candle (or use the date box) to choose the start">⏪ Replay</button>
     <button id="btnPlay" class="btn icon" title="Play / pause (Space)" disabled>▶</button>
     <button id="btnStepTick" class="btn icon" title="+1 tick (Shift + →)" disabled>+1</button>
     <button id="btnStepCandle" class="btn icon" title="Next candle (→)" disabled>⏭</button>
@@ -36,7 +49,7 @@
     <select id="speed" title="Replay speed"></select>
   </div>
   <div class="group">
-    <input type="datetime-local" id="jumpDate" step="1" title="Server time. In replay: moves the replay to this moment. Otherwise scrolls the chart there.">
+    <input type="datetime-local" id="jumpDate" step="1" title="Your local time (see Settings). In replay: moves the replay to this moment. Otherwise scrolls the chart there.">
     <button id="btnJump" class="btn">Go</button>
   </div>
 </header>
@@ -46,21 +59,24 @@
     <div id="chart"></div>
     <div id="daySeps"></div>
     <div id="chartTitle"><span id="titleSym">No data loaded</span> <span id="legend"></span></div>
+    <button id="btnInfo" class="btn small" title="Show / hide the CPR panel">CPR ⓘ</button>
     <div id="oneClick" class="hidden">
+      <div class="oc-top"><span id="ocMode" class="oc-badge"></span><label id="ocConfirmWrap" class="hidden" title="Send orders without asking first"><input type="checkbox" id="ocConfirm"> one-click</label></div>
       <button id="btnSell" class="oc sell"><small>SELL</small><b id="ocBid">—</b></button>
       <input type="number" id="lots" min="0.01" step="0.01" class="num" title="Lot size">
       <button id="btnBuy" class="oc buy"><small>BUY</small><b id="ocAsk">—</b></button>
       <div class="oc-row">
-        <button id="btnSellLimit" class="btn small" title="Then click on the chart where you want the order">Sell Limit</button>
-        <button id="btnBuyLimit" class="btn small" title="Then click on the chart where you want the order">Buy Limit</button>
+        <button id="btnSellLimit" class="btn small" title="Then tap the chart where you want the order">Sell Limit</button>
+        <button id="btnBuyLimit" class="btn small" title="Then tap the chart where you want the order">Buy Limit</button>
       </div>
     </div>
     <div id="infoPanel"></div>
+    <div id="lineMenu" class="hidden"></div>
     <div id="hint" class="hidden"></div>
     <div id="emptyMsg">
       <h2>Tick Chart</h2>
       <p>Open or drop one or more MT5 tick export files (<code>.csv</code> / <code>.txt</code>) to begin. Several files (e.g. one per day) are combined.</p>
-      <p class="muted">Use the <b>ExportTicks</b> script in the <code>mql5</code> folder, or MT5 → View → Symbols → Ticks → Export.<br>No file yet? Pick <b>Demo data</b> above.</p>
+      <p class="muted">Use the <b>ExportTicks</b> script in the <code>mql5</code> folder, or MT5 → View → Symbols → Ticks → Export.<br>No file yet? Pick <b>Demo data</b> above. For live data, run the bridge (see <code>bridge/SETUP.md</code>).</p>
     </div>
     <div id="busy" class="hidden">Loading…</div>
   </div>
@@ -73,16 +89,25 @@
       </div>
       <div id="acct"></div>
       <div id="status"></div>
+      <button id="btnPanel" class="btn small icon" title="Show / hide this panel">▾</button>
     </div>
     <div id="tabTrade" class="tabBody">
-      <table class="grid"><thead><tr><th>#</th><th>Type</th><th>Lots</th><th>Price</th><th>S/L</th><th>T/P</th><th>Current</th><th>Points</th><th>Profit</th><th></th></tr></thead><tbody id="openRows"></tbody></table>
+      <div class="tablewrap"><table class="grid"><thead><tr><th>#</th><th>Type</th><th>Lots</th><th>Price</th><th>S/L</th><th>T/P</th><th>Current</th><th>Points</th><th>Profit</th><th></th></tr></thead><tbody id="openRows"></tbody></table></div>
     </div>
     <div id="tabHistory" class="tabBody hidden">
-      <div class="hist-actions"><button id="btnExport" class="btn small">Export CSV</button><button id="btnCopyCsv" class="btn small">Copy CSV</button><button id="btnResetAcct" class="btn small">Reset account</button></div>
-      <table class="grid"><thead><tr><th>#</th><th>Type</th><th>Lots</th><th>Open time</th><th>Open</th><th>Close time</th><th>Close</th><th>Reason</th><th>Points</th><th>Profit</th></tr></thead><tbody id="histRows"></tbody></table>
+      <div class="hist-actions"><button id="btnExport" class="btn small">Export CSV</button><button id="btnCopyCsv" class="btn small">Copy CSV</button><button id="btnResetAcct" class="btn small">Reset paper account</button></div>
+      <div class="tablewrap"><table class="grid"><thead><tr><th>#</th><th>Type</th><th>Lots</th><th>Open time</th><th>Open</th><th>Close time</th><th>Close</th><th>Reason</th><th>Points</th><th>Profit</th></tr></thead><tbody id="histRows"></tbody></table></div>
     </div>
   </section>
 </main>
+
+<dialog id="confirmDlg">
+  <form method="dialog">
+    <h3 id="confirmTitle">Confirm</h3>
+    <p id="confirmText" class="pre"></p>
+    <div class="dlg-actions"><button value="cancel" class="btn">Cancel</button><button value="ok" class="btn primary" id="confirmOk">Send</button></div>
+  </form>
+</dialog>
 
 <dialog id="settingsDlg">
   <form method="dialog" id="settingsForm">
@@ -93,7 +118,24 @@
         <label>Count <select name="countMode"><option value="all">every tick</option><option value="bid">only bid changes</option></select></label>
         <label><input type="checkbox" name="syncDay"> New candle at start of each day</label>
         <label><input type="checkbox" name="daySep"> Day separators</label>
-        <label><input type="checkbox" name="askLine"> Show ask line in replay</label>
+        <label><input type="checkbox" name="askLine"> Show ask line when trading</label>
+      </fieldset>
+      <fieldset>
+        <legend>Time</legend>
+        <label>Show times in
+          <select name="tz.display">
+            <option value="America/Toronto">Kitchener (Eastern time)</option>
+            <option value="device">This device's time zone</option>
+            <option value="server">MT5 server time</option>
+          </select></label>
+        <label>MT5 server clock
+          <select name="tz.server">
+            <option value="ny7">New York + 7h (most brokers)</option>
+            <option value="2">GMT+2 all year</option>
+            <option value="3">GMT+3 all year</option>
+            <option value="0">GMT+0</option>
+          </select></label>
+        <p class="muted">Days and CPR always follow the broker's trading day (it starts at 17:00 New York / Kitchener time).</p>
       </fieldset>
       <fieldset>
         <legend>Moving averages</legend>
@@ -113,16 +155,17 @@
         <label><input type="checkbox" name="cpr.showRS"> Show R1–R3 / S1–S3</label>
         <div class="marow">P <input type="color" name="cpr.colP"> TC/BC <input type="color" name="cpr.colCPR"> R <input type="color" name="cpr.colR"> S <input type="color" name="cpr.colS"></div>
         <div class="marow">Narrow &lt; <input type="number" name="cpr.narrowPct" step="0.01" class="num s">% Wide &gt; <input type="number" name="cpr.widePct" step="0.01" class="num s">%</div>
-        <p class="muted">First loaded day has no previous day. Either export one extra day, or enter that previous day's values:</p>
+        <p class="muted">With files, the first loaded day has no previous day: load one extra day, or enter that day's values (not needed with the bridge):</p>
         <div class="marow">H <input type="number" name="firstHLC.h" step="any" class="num"> L <input type="number" name="firstHLC.l" step="any" class="num"> C <input type="number" name="firstHLC.c" step="any" class="num"></div>
       </fieldset>
       <fieldset>
-        <legend>Paper trading</legend>
+        <legend>Trading</legend>
         <label>Value of 1 point for 1 lot <input type="number" name="vpp" step="any" class="num"> <input type="text" name="cur" class="num s"></label>
-        <p class="muted">Saved per symbol. e.g. GER40 often 1 EUR, XAUUSD usually 100 USD. Check your broker's contract size.</p>
-        <label>Starting balance <input type="number" name="trade.balance" step="any" class="num"></label>
+        <p class="muted" id="vppNote"></p>
         <label>Default S/L (points, 0 = none) <input type="number" name="trade.slPts" step="any" class="num"></label>
         <label>Default T/P (points, 0 = none) <input type="number" name="trade.tpPts" step="any" class="num"></label>
+        <label><input type="checkbox" name="trade.confirm"> Ask before sending live orders</label>
+        <label>Paper starting balance <input type="number" name="trade.balance" step="any" class="num"></label>
       </fieldset>
     </div>
     <div class="dlg-actions"><button value="cancel" class="btn">Cancel</button><button value="ok" class="btn primary" id="settingsOk">Apply</button></div>
@@ -133,6 +176,7 @@
 <footer id="attrib">Charts: <a href="https://www.tradingview.com/lightweight-charts/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a></footer>
 
 <script src="js/lib/lightweight-charts.standalone.production.js"></script>
+<script src="js/time.js"></script>
 <script src="js/data.js"></script>
 <script src="js/app.js"></script>
 </body>
