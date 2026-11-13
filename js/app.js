@@ -871,17 +871,36 @@
     render(false);
   });
 
-  $('btnExport').addEventListener('click', () => {
-    if (!TR.history.length) return toast('No trades to export');
+  function tradesCsv() {
     const head = 'id,side,lots,open_time,open_price,close_time,close_price,reason,points,profit,sl,tp';
     const rows = TR.history.map(h => [h.id, h.side, h.lots, fmtIso(ticks.t[h.entryTick]), h.entry, fmtIso(ticks.t[h.exitTick]), h.exit, h.reason, h.points.toFixed(digits()), h.pnl.toFixed(2), h.sl ?? '', h.tp ?? ''].join(','));
-    const blob = new Blob([head + '\n' + rows.join('\n') + '\n'], { type: 'text/csv' });
+    return head + '\n' + rows.join('\n') + '\n';
+  }
+  $('btnExport').addEventListener('click', () => {
+    if (!TR.history.length) return toast('No trades to export');
+    const blob = new Blob([tradesCsv()], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `trades_${symbolKey() || 'tickchart'}_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   });
-  $('btnResetAcct').addEventListener('click', () => { if (confirm('Clear all trades and reset the balance?')) resetAccount(false); });
+  // Two-click confirmation (browser confirm() dialogs are blocked in some embedded viewers).
+  const btnReset = $('btnResetAcct');
+  btnReset.addEventListener('click', () => {
+    if (btnReset.dataset.armed) {
+      clearTimeout(btnReset._t); delete btnReset.dataset.armed; btnReset.textContent = 'Reset account';
+      resetAccount(false);
+    } else {
+      btnReset.dataset.armed = '1'; btnReset.textContent = 'Click again to reset';
+      btnReset._t = setTimeout(() => { delete btnReset.dataset.armed; btnReset.textContent = 'Reset account'; }, 3000);
+    }
+  });
+  $('btnCopyCsv').addEventListener('click', () => {
+    if (!TR.history.length) return toast('No trades to copy');
+    const csv = tradesCsv();
+    navigator.clipboard.writeText(csv).then(() => toast('Trade log copied. Paste it into Excel or a text file.'))
+      .catch(() => toast('Copy was blocked by the browser'));
+  });
 
   // tabs
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
