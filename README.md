@@ -78,7 +78,7 @@ The app reads this tab-separated format directly (UTF-16 or UTF-8).
 - **Drag a position's entry line** up or down to create a T/P or S/L (like MT5).
 - **+SL / +TP / ✕** buttons in the Trade tab. Default S/L and T/P distances can be set in Settings.
 - Fills: buy orders fill at ask, sell orders at bid. Limit orders and T/P fill at your price; stop orders and S/L fill at the market price, so a gap causes slippage.
-- **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, with defaults of GER40 = 10 EUR (contract size 10) and XAUUSD = 100 USD. With the bridge, the value comes from MT5. Check your broker's contract specification.
+- **Value of 1 point for 1 lot** (Settings) converts points to money. It is saved per symbol, in USD, with defaults of GER40 = 11.6 USD (10 EUR per point per lot, converted at about 1.16 USD/EUR) and XAUUSD = 100 USD. With the bridge, the value comes from MT5. Check your broker's contract specification.
 - The History tab has **Export CSV** and **Reset account**.
 
 ## How ticks are counted

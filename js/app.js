@@ -63,14 +63,15 @@
     const k = symbolKey();
     if (S.vppBySymbol[k] !== undefined && S.vppBySymbol[k] !== '') return +S.vppBySymbol[k];
     if (/XAU/.test(k)) return 100;
-    if (/GER|DE40|DAX/.test(k)) return 10;
+    // GER40: contract size 10 EUR per point per lot, shown in USD (the account currency) at about 1.16 USD/EUR
+    if (/GER|DE40|DAX/.test(k)) return 11.6;
     return 1;
   }
   function currency() {
     if (symInfo() && LIVE.account) return LIVE.account.currency;
     const k = symbolKey();
     if (S.curBySymbol[k]) return S.curBySymbol[k];
-    return /XAU|USD$|US30|NAS|SPX/.test(k) ? 'USD' : 'EUR';
+    return 'USD';
   }
   const digits = () => (ticks ? ticks.digits : 2);
   const fmtP = p => (p == null || !isFinite(p)) ? '—' : p.toFixed(digits());
@@ -1283,7 +1284,7 @@
     }
     const fromMt5 = !!symInfo();
     form.elements.vpp.disabled = fromMt5; form.elements.cur.disabled = fromMt5;
-    $('vppNote').textContent = fromMt5 ? 'Taken from MT5 for this symbol.' : 'Saved per symbol. GER40 is usually 10 EUR (contract size 10), XAUUSD 100 USD.';
+    $('vppNote').textContent = fromMt5 ? 'Taken from MT5 for this symbol.' : 'Saved per symbol, in your account currency (USD). GER40: 10 EUR per point per lot ≈ 11.6 USD (changes with EUR/USD). XAUUSD: 100 USD. With the bridge, MT5 supplies the exact value.';
     dlg.showModal();
   });
   dlg.addEventListener('close', () => {
