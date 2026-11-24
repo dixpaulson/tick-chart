@@ -114,7 +114,9 @@ Open it with Notepad and restart the bridge after any change.
 - the best move each made
 
 Double-click it with MT5 open. The report is shown on screen and saved to `bridge\data\ema_study_GER40.txt` and `.csv`.
-Options, for example: `run_ema_study.bat --days 180 --target 100 --start 01:30 --end 03:30 --fast 9 --slow 21`.
+It also back-tests a **strategy** on the same crossings: a 20-point stop, exit if the EMAs cross back before +100, and after +100 one of several exits (take profit, trailing 30/50/75 points, or hold to the cross-back). Results are after spread, in points and in dollars at 0.1 lot, with win rate, drawdown, worst losing run and a first-half vs second-half comparison.
+
+Options, for example: `run_ema_study.bat --days 180 --target 100 --stop 20 --spread 3 --lots 0.1 --start 01:30 --end 03:30 --fast 9 --slow 21`.
 
 ## Troubleshooting
 

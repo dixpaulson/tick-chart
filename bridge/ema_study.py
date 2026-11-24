@@ -78,6 +78,7 @@ def analyze(bars, tf_seconds, fast=9, slow=21, target=100.0, start_min=90, end_m
                 end_k = k
                 break
         res.append({
+            "i": i, "d": d, "fast": fast, "slow": slow,
             "local_time": local,
             "direction": "BULL" if d > 0 else "BEAR",
             "entry": entry,
@@ -90,6 +91,90 @@ def analyze(bars, tf_seconds, fast=9, slow=21, target=100.0, start_min=90, end_m
             "still_open": end_k is None,
         })
     return res
+
+
+# ---------------------------------------------------------------- strategy test
+def simulate(bars, ef, es, i, d, stop_pts, target, trail, spread):
+    """One trade: entry at bars[i] close, stop `stop_pts` away; before +target it also exits if the EMAs cross back.
+    After +target: trail = 'tp' (take profit at +target), a number (trailing stop that many points behind the best
+    price), or 'cross' (stop to break-even, exit when the EMAs cross back).
+    Candles only show high/low, so when one candle touches both the stop and a better price, the stop is assumed
+    to come first (the cautious choice). Returns (points after spread, exit index, reason, reached_target)."""
+    entry = bars[i]["close"]
+    stop = entry - d * stop_pts
+    reached = False
+    n = len(bars)
+    for k in range(i + 1, n):
+        b = bars[k]
+        if (d > 0 and b["low"] <= stop) or (d < 0 and b["high"] >= stop):
+            return (stop - entry) * d - spread, k, ("trail" if reached else "stop"), reached
+        fav = b["high"] if d > 0 else b["low"]
+        if not reached and (fav - entry) * d >= target:
+            reached = True
+            if trail == "tp":
+                return target - spread, k, "target", True
+            if trail == "cross":
+                stop = entry
+        if reached and trail not in ("tp", "cross"):
+            new = fav - d * float(trail)
+            stop = max(stop, new) if d > 0 else min(stop, new)
+        x = ef[k] - es[k]
+        if x == x and x != 0 and (x > 0) != (d > 0) and (not reached or trail == "cross"):
+            return (b["close"] - entry) * d - spread, k, "cross", reached
+    return (bars[-1]["close"] - entry) * d - spread, n - 1, "open", reached
+
+
+def stats(pnls):
+    n = len(pnls)
+    if not n:
+        return None
+    wins = [p for p in pnls if p > 0]
+    loss = [p for p in pnls if p <= 0]
+    eq = peak = dd = 0.0
+    streak = worst_streak = 0
+    for p in pnls:
+        eq += p; peak = max(peak, eq); dd = max(dd, peak - eq)
+        streak = streak + 1 if p <= 0 else 0
+        worst_streak = max(worst_streak, streak)
+    gl = -sum(loss)
+    return {"n": n, "win": len(wins) / n, "total": sum(pnls), "avg": sum(pnls) / n, "dd": dd,
+            "pf": (sum(wins) / gl) if gl > 0 else float("inf"), "streak": worst_streak,
+            "best": max(pnls), "worst": min(pnls)}
+
+
+def strategy_report(tf, bars, rows, stop_pts, target, spread, money_per_point, lots, open_min, offset_h):
+    ef = ema([b["close"] for b in bars], rows[0]["fast"]) if rows else None
+    lines = []
+    if not rows:
+        return f"\n--- {tf} strategy test: no crossings ---"
+    es = ema([b["close"] for b in bars], rows[0]["slow"])
+    usd = money_per_point * lots
+    variants = [("TP at +%g" % target, "tp"), ("trail 30", 30), ("trail 50", 50), ("trail 75", 75), ("hold to cross-back", "cross")]
+    lines.append(f"\n--- {tf} STRATEGY TEST: stop {stop_pts:g}, after +{target:g}: see each row; spread {spread:g} pts/trade; "
+                 f"$ at {lots:g} lot ({money_per_point:g} per point per lot) ---")
+    lines.append(f"  {'exit after +' + format(target, 'g'):<20}{'trades':>7}{'win%':>6}{'total pts':>11}{'avg/trade':>11}{'$ total':>10}"
+                 f"{'max DD':>8}{'PF':>6}{'lose run':>9}   1st half avg | 2nd half avg")
+    half = len(rows) // 2
+    best = None
+    for name, tr in variants:
+        res = [simulate(bars, ef, es, r["i"], r["d"], stop_pts, target, tr, spread) for r in rows]
+        p = [x[0] for x in res]
+        st = stats(p)
+        h1, h2 = stats(p[:half]), stats(p[half:])
+        pf = "inf" if st["pf"] == float("inf") else f"{st['pf']:.2f}"
+        lines.append(f"  {name:<20}{st['n']:>7}{st['win'] * 100:>5.0f}%{st['total']:>11.1f}{st['avg']:>11.1f}{st['total'] * usd:>10.0f}"
+                     f"{st['dd']:>8.0f}{pf:>6}{st['streak']:>9}   {(h1['avg'] if h1 else float('nan')):>+11.1f} | {(h2['avg'] if h2 else float('nan')):+.1f}")
+        if tr == 50:
+            best = res
+    # before vs after the Frankfurt open, for the trail-50 variant
+    if best:
+        pre = [x[0] for x, r in zip(best, rows) if (r["local_time"].hour * 60 + r["local_time"].minute) < open_min]
+        post = [x[0] for x, r in zip(best, rows) if (r["local_time"].hour * 60 + r["local_time"].minute) >= open_min]
+        for label, arr in (("before 03:00 open", pre), ("from 03:00 open", post)):
+            st = stats(arr)
+            if st:
+                lines.append(f"  trail 50, {label:<18}: {st['n']} trades, win {st['win'] * 100:.0f}%, avg {st['avg']:+.1f} pts, total {st['total']:+.1f} pts")
+    return "\n".join(lines)
 
 
 def summarize(tf, rows, target):
@@ -129,6 +214,10 @@ def main():
     ap.add_argument("--end", default="03:30", help="window end, your local time (HH:MM)")
     ap.add_argument("--offset", type=float, default=-7, help="hours from server time to your time (Toronto: -7)")
     ap.add_argument("--timeframes", default="H1,M15,M5")
+    ap.add_argument("--stop", type=float, default=20, help="stop loss in points for the strategy test")
+    ap.add_argument("--spread", type=float, default=3.0, help="cost per trade in points (your typical spread)")
+    ap.add_argument("--money-per-point", type=float, default=11.6, help="account currency per point for 1 lot (GER40 ~11.6 USD)")
+    ap.add_argument("--lots", type=float, default=0.1)
     args = ap.parse_args()
 
     try:
@@ -162,6 +251,8 @@ def main():
         first = dt.datetime.utcfromtimestamp(max(bars[0]["time"], from_time) + args.offset * 3600)
         rows = analyze(bars, secs, args.fast, args.slow, args.target, sh * 60 + sm, eh * 60 + em, args.offset, from_time)
         out.append(summarize(tf, rows, args.target) + f"\n  (history used from {first:%Y-%m-%d})")
+        out.append(strategy_report(tf, bars, rows, args.stop, args.target, args.spread, args.money_per_point, args.lots,
+                                   3 * 60, args.offset))
         for r in rows:
             all_rows.append({"timeframe": tf, **r})
     mt5.shutdown()
