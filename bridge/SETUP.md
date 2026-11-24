@@ -106,6 +106,16 @@ Open it with Notepad and restart the bridge after any change.
 
 **Moving to a live account later:** log MT5 in to the live account, set `"demo_only": false`, and restart the bridge. The page then shows a red **LIVE account** badge and red confirm buttons.
 
+## EMA crossing study (optional)
+
+`run_ema_study.bat` reads H1, M15 and M5 bars straight from MT5. It finds every EMA 9 / EMA 21 crossing whose candle closed between 01:30 and 03:30 Toronto time, and reports:
+- how many reached +100 points before the EMAs crossed back
+- how far each went against you first
+- the best move each made
+
+Double-click it with MT5 open. The report is shown on screen and saved to `bridge\data\ema_study_GER40.txt` and `.csv`.
+Options, for example: `run_ema_study.bat --days 180 --target 100 --start 01:30 --end 03:30 --fast 9 --slow 21`.
+
 ## Troubleshooting
 
 | Problem | Fix |
