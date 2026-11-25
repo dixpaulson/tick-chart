@@ -78,7 +78,7 @@ def analyze(bars, tf_seconds, fast=9, slow=21, target=100.0, start_min=90, end_m
                 end_k = k
                 break
         res.append({
-            "i": i, "d": d, "fast": fast, "slow": slow,
+            "i": i, "d": d, "fast": fast, "slow": slow, "close_t": close_t,
             "local_time": local,
             "direction": "BULL" if d > 0 else "BEAR",
             "entry": entry,
@@ -177,6 +177,114 @@ def strategy_report(tf, bars, rows, stop_pts, target, spread, money_per_point, l
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- filters
+def cpr_levels(h, l, c):
+    p = (h + l + c) / 3
+    bc = (h + l) / 2
+    tc = 2 * p - bc
+    return p, max(tc, bc), min(tc, bc)
+
+
+def annotate(rows, bars, h1_bars, daily, open_min=180, narrow=0.15, wide=0.35):
+    """Add filter fields to each crossing. Everything uses only information available at the crossing."""
+    # H1 trend: EMA 9 vs 21 on the last CLOSED H1 candle before the crossing
+    h1_close = [b["close"] for b in h1_bars]
+    h9, h21 = ema(h1_close, 9), ema(h1_close, 21)
+    h1_end = [b["time"] + 3600 for b in h1_bars]
+    j = 0
+    # daily H/L/C keyed by server day -> CPR of the following trading day
+    days = sorted(daily)
+    prev_of = {days[k]: daily[days[k - 1]] for k in range(1, len(days))}
+    seen_today = {}
+    for r in rows:
+        t = r["close_t"]
+        while j + 1 < len(h1_end) and h1_end[j + 1] <= t:
+            j += 1
+        trend = 0
+        if j < len(h1_end) and h1_end[j] <= t and h9[j] == h9[j] and h21[j] == h21[j]:
+            trend = 1 if h9[j] > h21[j] else -1
+        r["h1_agree"] = trend == r["d"]
+        day = t // 86400
+        pv = prev_of.get(day)
+        if pv:
+            p, tc, bc = cpr_levels(*pv)
+            wpct = (tc - bc) / p * 100
+            r["cpr_class"] = "narrow" if wpct < narrow else ("wide" if wpct > wide else "normal")
+            r["cpr_side"] = (r["d"] > 0 and r["entry"] > tc) or (r["d"] < 0 and r["entry"] < bc)
+            r["cpr_inside"] = bc <= r["entry"] <= tc
+        else:
+            r["cpr_class"], r["cpr_side"], r["cpr_inside"] = "unknown", False, False
+        m = r["local_time"].hour * 60 + r["local_time"].minute
+        k = r["local_time"].date()
+        seen_today[k] = seen_today.get(k, 0) + 1
+        r["nth_today"] = seen_today[k]
+        r["slot"] = f"{(m // 30) * 30 // 60:02d}:{(m // 30) * 30 % 60:02d}"
+        r["after_open"] = m >= open_min
+    first_after = set()
+    got = set()
+    for r in rows:
+        k = r["local_time"].date()
+        if r["after_open"] and k not in got:
+            got.add(k); first_after.add(id(r))
+    for r in rows:
+        r["first_after_open"] = id(r) in first_after
+    return rows
+
+
+def filter_report(tf, bars, rows, stop_pts, target, spread, holdout_from, extra_rows=None):
+    if not rows:
+        return ""
+    ef = ema([b["close"] for b in bars], rows[0]["fast"])
+    es = ema([b["close"] for b in bars], rows[0]["slow"])
+    variants = [("TP+%g" % target, "tp"), ("trail75", 75), ("hold", "cross")]
+    filters = [
+        ("ALL", lambda r: True),
+        ("slot 01:30", lambda r: r["slot"] == "01:30"), ("slot 02:00", lambda r: r["slot"] == "02:00"),
+        ("slot 02:30", lambda r: r["slot"] == "02:30"), ("slot 03:00+", lambda r: r["after_open"]),
+        ("1st crossing of day", lambda r: r["nth_today"] == 1),
+        ("1st or 2nd of day", lambda r: r["nth_today"] <= 2),
+        ("1st after 03:00", lambda r: r["first_after_open"]),
+        ("H1 trend agrees", lambda r: r["h1_agree"]), ("H1 trend against", lambda r: not r["h1_agree"]),
+        ("CPR narrow day", lambda r: r["cpr_class"] == "narrow"), ("CPR normal day", lambda r: r["cpr_class"] == "normal"),
+        ("CPR wide day", lambda r: r["cpr_class"] == "wide"),
+        ("price beyond CPR in trade dir", lambda r: r["cpr_side"]), ("price inside CPR", lambda r: r["cpr_inside"]),
+        ("H1 agrees + beyond CPR", lambda r: r["h1_agree"] and r["cpr_side"]),
+        ("H1 agrees + 1st/2nd of day", lambda r: r["h1_agree"] and r["nth_today"] <= 2),
+        ("H1 agrees + after 03:00", lambda r: r["h1_agree"] and r["after_open"]),
+    ]
+    cache = {}
+    def res(r, tr):
+        key = (r["i"], tr)
+        if key not in cache:
+            cache[key] = simulate(bars, ef, es, r["i"], r["d"], stop_pts, target, tr, spread)[0]
+        return cache[key]
+    hd = dt.datetime.utcfromtimestamp(holdout_from)
+    lines = [f"\n--- {tf} FILTER TEST (stop {stop_pts:g}, spread {spread:g}). pts/trade: TUNE period | HOLD-OUT from {hd:%Y-%m-%d} (untouched). "
+             f"A real edge should be positive in BOTH. ---",
+             f"  {'filter':<30}{'n tune':>7}{'n hold':>7}" + "".join(f"{name:>20}" for name, _ in variants) + f"{'win% (trail75)':>16}"]
+    for fname, f in filters:
+        sel = [r for r in rows if f(r)]
+        tune = [r for r in sel if r["close_t"] < holdout_from]
+        hold = [r for r in sel if r["close_t"] >= holdout_from]
+        if len(sel) < 8:
+            continue
+        cells = ""
+        for _, tr in variants:
+            a = sum(res(r, tr) for r in tune) / len(tune) if tune else float("nan")
+            b = sum(res(r, tr) for r in hold) / len(hold) if hold else float("nan")
+            flag = "*" if a > 0 and b > 0 else " "
+            cells += f"{a:>+9.1f} |{b:>+7.1f}{flag}"
+        wins = sum(1 for r in sel if res(r, 75) > 0)
+        lines.append(f"  {fname:<30}{len(tune):>7}{len(hold):>7}{cells}{wins / len(sel) * 100:>15.0f}%")
+    if extra_rows:
+        lines.append("  Fresh window never used before (03:30-04:30): does the 'after the open' idea carry over?")
+        for name, tr in variants:
+            p = [res(r, tr) for r in extra_rows]
+            lines.append(f"    {name:<10} {len(p)} trades, avg {sum(p) / len(p):+.1f} pts, total {sum(p):+.1f}")
+    lines.append("  * = positive in both the tune period and the hold-out. Treat small groups (n < 40) as noise.")
+    return "\n".join(lines)
+
+
 def summarize(tf, rows, target):
     lines = []
     n = len(rows)
@@ -218,6 +326,7 @@ def main():
     ap.add_argument("--spread", type=float, default=3.0, help="cost per trade in points (your typical spread)")
     ap.add_argument("--money-per-point", type=float, default=11.6, help="account currency per point for 1 lot (GER40 ~11.6 USD)")
     ap.add_argument("--lots", type=float, default=0.1)
+    ap.add_argument("--holdout-days", type=int, default=90, help="most recent days kept aside to check filters")
     args = ap.parse_args()
 
     try:
@@ -239,6 +348,12 @@ def main():
            f"(your time = server {args.offset:+g}h), last {args.days} days. Entry = close of the crossing candle; "
            f"win = +{args.target:g} pts before the EMAs cross back."]
     all_rows = []
+    # data for the filters: H1 bars (trend) and daily bars (CPR)
+    h1r = mt5.copy_rates_from_pos(args.symbol, mt5.TIMEFRAME_H1, 0, int(args.days * 24 + 600))
+    h1_bars = [{"time": int(r["time"]), "close": float(r["close"])} for r in (h1r if h1r is not None else [])]
+    d1r = mt5.copy_rates_from_pos(args.symbol, mt5.TIMEFRAME_D1, 0, int(args.days + 20))
+    daily = {int(r["time"]) // 86400: (float(r["high"]), float(r["low"]), float(r["close"])) for r in (d1r if d1r is not None else [])}
+    holdout_from = int(tick.time) - args.holdout_days * 86400
     for tf in [t.strip().upper() for t in args.timeframes.split(",")]:
         secs = TF_SECONDS[tf]
         count = args.days * 86400 // secs + 600            # + warm-up bars for the EMAs
@@ -253,6 +368,10 @@ def main():
         out.append(summarize(tf, rows, args.target) + f"\n  (history used from {first:%Y-%m-%d})")
         out.append(strategy_report(tf, bars, rows, args.stop, args.target, args.spread, args.money_per_point, args.lots,
                                    3 * 60, args.offset))
+        if tf in ("M5", "M15") and rows:
+            annotate(rows, bars, h1_bars, daily)
+            extra = analyze(bars, secs, args.fast, args.slow, args.target, 210 + 1, 270, args.offset, from_time)
+            out.append(filter_report(tf, bars, rows, args.stop, args.target, args.spread, holdout_from, extra))
         for r in rows:
             all_rows.append({"timeframe": tf, **r})
     mt5.shutdown()
