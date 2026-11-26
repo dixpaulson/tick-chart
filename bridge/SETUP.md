@@ -126,6 +126,17 @@ The default is XAUUSD at 0.01 lot. For other symbols, for example: `run_ema_scan
 
 The report is saved to `bridge\data\ema_scan_XAUUSD.txt`. Note: MT5 only keeps as many bars as **Tools → Options → Charts → Max bars in chart**, so M1 may cover only a few months unless that is set to Unlimited.
 
+## Tick-level verification
+
+`run_ema_verify.bat` replays the best candidates from the scan on **real MT5 ticks**:
+- **entry** at the first tick after the crossing candle closes (buy at the ask, sell at the bid)
+- **stops, targets and trailing stops** checked tick by tick, so there's no guessing inside a candle
+- **real spread** and slippage on stops
+
+It shows, for the tune period and the untouched last 90 days, what the ticks say next to what the candle test said.
+The default is XAUUSD, 0.01 lot, M5/M15/M30, the last 180 days. Example: `run_ema_verify.bat --timeframes M15 --combos 5/3/TRL,5/5/TRL --days 120`.
+The first run downloads tick history from your broker, so it can take several minutes.
+
 ## Troubleshooting
 
 | Problem | Fix |
