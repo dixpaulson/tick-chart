@@ -137,6 +137,18 @@ It shows, for the tune period and the untouched last 90 days, what the ticks say
 The default is XAUUSD, 0.01 lot, M5/M15/M30, the last 180 days. Example: `run_ema_verify.bat --timeframes M15 --combos 5/3/TRL,5/5/TRL --days 120`.
 The first run downloads tick history from your broker, so it can take several minutes.
 
+## Opening range breakout (ORB) study
+
+`run_orb_scan.bat` tests opening range breakouts at the Tokyo, London, COMEX (08:20 New York) and NYSE opens. Each session uses its own local time and daylight-saving rules.
+- **Opening range:** the first 5, 15, 30 or 60 minutes.
+- **Entry:** the first break within 2 hours.
+- **Stop:** the other side of the range, or its middle.
+- **Exit:** a 1R/2R/3R target, or a time exit.
+
+It also tests whether **high opening volume** helps (tick volume compared with the 20-day average), then re-tests the best combinations on **real ticks**. Every result is shown for the tune period and for the untouched last 90 days.
+
+For a Raw account, add your commission per trade at your lot size, for example: `run_orb_scan.bat --commission 0.07`. For GER40: `run_orb_scan.bat --symbol GER40 --lots 0.1`.
+
 ## Troubleshooting
 
 | Problem | Fix |
