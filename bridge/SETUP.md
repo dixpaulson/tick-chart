@@ -118,6 +118,14 @@ It also back-tests a **strategy** on the same crossings: a 20-point stop, exit i
 
 Options, for example: `run_ema_study.bat --days 180 --target 100 --stop 20 --spread 3 --lots 0.1 --start 01:30 --end 03:30 --fast 9 --slow 21`.
 
+## EMA crossover scan (which timeframe / stop / target / hours?)
+
+`run_ema_scan.bat` tests EMA 9/21 crossings on M1, M5, M15, M30 and H1 across the whole day. It tries a grid of stops and targets, each with three exits, and uses MT5's own spread for each trade and MT5's money value per point. Results are shown for a tune period and for the last 90 untouched days.
+
+The default is XAUUSD at 0.01 lot. For other symbols, for example: `run_ema_scan.bat --symbol GER40 --lots 0.1`, or set your own grid: `--stops 1,2,3 --targets 5,10,20 --start 01:30 --end 03:30`.
+
+The report is saved to `bridge\data\ema_scan_XAUUSD.txt`. Note: MT5 only keeps as many bars as **Tools → Options → Charts → Max bars in chart**, so M1 may cover only a few months unless that is set to Unlimited.
+
 ## Troubleshooting
 
 | Problem | Fix |

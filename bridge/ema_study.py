@@ -23,6 +23,11 @@ from pathlib import Path
 
 TF_SECONDS = {"H1": 3600, "M15": 900, "M5": 300}
 
+def _utc(ts):
+    """Naive datetime for a UTC timestamp (no deprecation warnings on newer Python)."""
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).replace(tzinfo=None)
+
+
 
 def ema(values, period):
     """Standard EMA, seeded with the simple average of the first `period` values (same as the web app)."""
@@ -54,7 +59,7 @@ def analyze(bars, tf_seconds, fast=9, slow=21, target=100.0, start_min=90, end_m
         close_t = bars[i]["time"] + tf_seconds                    # crossing confirmed when the candle closes
         if bars[i]["time"] < from_time:
             continue
-        local = dt.datetime.utcfromtimestamp(close_t + local_offset_h * 3600)
+        local = _utc(close_t + local_offset_h * 3600)
         m = local.hour * 60 + local.minute
         if not (start_min <= m <= end_min):
             continue
@@ -87,7 +92,7 @@ def analyze(bars, tf_seconds, fast=9, slow=21, target=100.0, start_min=90, end_m
             "against_before_hit": mae_before_hit,          # how far it went the other way before reaching the target
             "against_until_exit": mae,                      # ...or before the EMAs crossed back
             "best_move": mfe,
-            "exit_local": dt.datetime.utcfromtimestamp(bars[end_k]["time"] + tf_seconds + local_offset_h * 3600) if end_k is not None else None,
+            "exit_local": _utc(bars[end_k]["time"] + tf_seconds + local_offset_h * 3600) if end_k is not None else None,
             "still_open": end_k is None,
         })
     return res
@@ -258,7 +263,7 @@ def filter_report(tf, bars, rows, stop_pts, target, spread, holdout_from, extra_
         if key not in cache:
             cache[key] = simulate(bars, ef, es, r["i"], r["d"], stop_pts, target, tr, spread)[0]
         return cache[key]
-    hd = dt.datetime.utcfromtimestamp(holdout_from)
+    hd = _utc(holdout_from)
     lines = [f"\n--- {tf} FILTER TEST (stop {stop_pts:g}, spread {spread:g}). pts/trade: TUNE period | HOLD-OUT from {hd:%Y-%m-%d} (untouched). "
              f"A real edge should be positive in BOTH. ---",
              f"  {'filter':<30}{'n tune':>7}{'n hold':>7}" + "".join(f"{name:>20}" for name, _ in variants) + f"{'win% (trail75)':>16}"]
@@ -363,7 +368,7 @@ def main():
             continue
         bars = [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
                  "low": float(r["low"]), "close": float(r["close"])} for r in rates]
-        first = dt.datetime.utcfromtimestamp(max(bars[0]["time"], from_time) + args.offset * 3600)
+        first = _utc(max(bars[0]["time"], from_time) + args.offset * 3600)
         rows = analyze(bars, secs, args.fast, args.slow, args.target, sh * 60 + sm, eh * 60 + em, args.offset, from_time)
         out.append(summarize(tf, rows, args.target) + f"\n  (history used from {first:%Y-%m-%d})")
         out.append(strategy_report(tf, bars, rows, args.stop, args.target, args.spread, args.money_per_point, args.lots,
